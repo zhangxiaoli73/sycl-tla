@@ -305,9 +305,13 @@ struct ExampleRunner {
 
 int main(int argc, const char** argv)
 {
-  //
-  // Parse options
-  //
+  MPI_Init(&argc, &argv);
+
+  int world_size, rank;
+  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+  std::cout << "MPI initialized, rank " << rank << " / " << world_size << "\n";
 
   Options options;
 
@@ -431,8 +435,11 @@ int main(int argc, const char** argv)
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   ExampleRunner<Gemm> runner;
+  // get remote data ptrs
+  // get symm buffers
+  auto tmp = SymmMemory(m, n, k, world_size, rank);
+  CUTLASS_CHECK(runner.run(options, hw_info, rank, world_size, remote_data_ptrs, remote_flag_ptrs));
 
-  CUTLASS_CHECK(runner.run(options, hw_info));
-
+  MPI_Finalize();
   return 0;
 }

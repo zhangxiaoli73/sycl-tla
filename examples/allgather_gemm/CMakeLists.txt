@@ -1,5 +1,5 @@
 # Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
+# Copyright (C) 2025 Intel Corporation, All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 #
 # Redistribution and use in source and binary forms, with or without
@@ -27,13 +27,9 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+# set(CUTLASS_ISHEMM_COMMON_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
-set(CUTLASS_EXAMPLES_COMMON_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
-
-add_custom_target(cutlass_examples)
-add_custom_target(test_examples)
-
-function(cutlass_example_add_executable NAME)
+function(add_cutlass_ishmem_executable NAME)
 
   set(options)
   set(oneValueArgs DISABLE_TESTS)
@@ -48,23 +44,25 @@ function(cutlass_example_add_executable NAME)
 
   add_dependencies(cutlass_examples ${NAME})
 
-  if (NOT CUTLASS_ENABLE_SYCL)
-    SET(ADD_CUDA ON)
-  endif()
+  # it will cause Sycl compilation error. use ISHMEM_PATH instead
+  # find_package(ISHMEM REQUIRED)
+
+  find_library(LEVELZERO_LIBRARY NAMES ze_loader)
 
   target_link_libraries(
     ${NAME}
     PRIVATE
     CUTLASS
     cutlass_tools_util_includes
-    $<$<BOOL:${CUTLASS_ENABLE_CUBLAS}>:nvidia::cublas>
-    $<$<BOOL:${ADD_CUDA}>:cuda>
+    # ISHMEM::ISHMEM
+    $ENV{ISHMEM_PATH}/lib/libishmem.a
+    ${LEVELZERO_LIBRARY}
     )
 
   target_include_directories(
     ${NAME}
     PRIVATE
-    ${CUTLASS_EXAMPLES_COMMON_SOURCE_DIR}
+    $ENV{ISHMEM_PATH}/include/
     ${CUTLASS_EXAMPLES_UTILS_DIR}
     ${CUTLASS_APPLICATIONS_DIR}
     )
@@ -90,47 +88,12 @@ function(cutlass_example_add_executable NAME)
 
 endfunction()
 
-# =============================================================================
-# CUTLASS SYCL Examples
-# =============================================================================
-# This CMakeLists.txt builds SYCL-based examples for CUTLASS.
+message(STATUS "Building distributed-gemm for Intel GPU targets")
 
-if(CUTLASS_ENABLE_SYCL)
-  message(STATUS "Building CUTLASS SYCL Examples")
-  if(SYCL_INTEL_TARGET)
-    message(STATUS "Building examples for Intel GPU targets")
-    foreach(EXAMPLE
-      00_bmg_gemm
-      00_bmg_gemm/legacy
-      01_bmg_gemm_with_collective_builder
-      02_bmg_gemm_mixed_dtype
-      02_bmg_gemm_mixed_dtype/legacy
-      03_bmg_gemm_streamk
-      03_bmg_gemm_streamk/legacy
-      04_bmg_grouped_gemm
-      04_bmg_grouped_gemm/legacy
-      05_bmg_gemm_with_epilogues
-      05_bmg_gemm_with_epilogues/legacy
-      06_bmg_flash_attention
-      06_bmg_flash_attention/legacy
-      07_bmg_dual_gemm
-      08_bmg_gemm_f8
-      09_bmg_grouped_gemm_f8
-      09_bmg_grouped_gemm_f8/legacy
-      10_bmg_grouped_gemm_mixed_dtype
-      11_xe20_cutlass_library
-      12_xe20_moe_gemm_cute_interface
-      13_bmg_gemm_bias
-      gemm_reducescatter
-      )
-      add_subdirectory(${EXAMPLE})
-    endforeach()
-  endif()
-  add_subdirectory(generics)
-  add_subdirectory(nv_sycl)
-  add_subdirectory(cute)
-else()
-  message(STATUS "CUTLASS_ENABLE_SYCL is OFF - no examples will be built")
-  message(STATUS "Enable SYCL support to build CUTLASS examples")
-endif()
+# set(CUTLASS_ISHEMM_COMMON_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
+
+add_cutlass_ishmem_executable(
+  allgather_gemm_main
+  allgather_gemm_main.cpp
+  )
 
