@@ -130,7 +130,7 @@ using namespace cute;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // TP size (= number of processors/GPUs)
-using TP = _8;
+using TP = _2;
 static constexpr int TP_ = TP{};
 
 // Distributed GEMM tiling/sharding schedule
@@ -144,7 +144,7 @@ static constexpr int TP_ = TP{};
 //   * ReduceScatter1D_TilingA_RotatingC
 //   * ReduceScatter1D_TilingB_RotatingC
 
-using DistSchedule = distributed::schedules::AllGather1D_TilingCD_RotatingA<TP>;
+using DistSchedule = distributed::schedules::ReduceScatter1D_TilingA_RotatingC<TP>;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 /// GEMM kernel configurations
@@ -371,6 +371,8 @@ bool initialize_tensor(
 
 /// Initialize operands to be used in the GEMM and reference GEMM
 void initialize(const Options &options) {
+  std::cout << "[LOG] Initializing tensors with M=" << options.m << " N=" << options.n 
+            << " K=" << options.k << " L=" << options.l << std::endl;
   auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
 
   // Setup (reference) GEMM tensors
@@ -398,9 +400,11 @@ void initialize(const Options &options) {
   initialize_tensor(tensor_B.host_view(), seed + 2023);
   initialize_tensor(tensor_C.host_view(), seed + 2024);
 
+  std::cout << "[LOG] Syncing tensors to device..." << std::endl;
   tensor_A.sync_device();
   tensor_B.sync_device();
   tensor_C.sync_device();
+  std::cout << "[LOG] Tensor sync complete" << std::endl;
 
   tensor_A.sync_host();
   tensor_B.sync_host();
@@ -409,22 +413,27 @@ void initialize(const Options &options) {
   tensor_ref_D.sync_host();
 
   // Set up DistGEMM tensors
+  std::cout << "[LOG] Getting local shapes for TP=" << TP_ << std::endl;
   auto local_shape_A = DistSchedule::get_local_a_shape(problem_shape);
   auto local_shape_B = DistSchedule::get_local_b_shape(problem_shape);
   auto local_shape_C = DistSchedule::get_local_c_shape(problem_shape);
   auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
+  std::cout << "[LOG] Local shapes obtained" << std::endl;
 
   auto a_coord_device = cutlass::make_Coord(size(local_shape_A), 1);
   auto b_coord_device = cutlass::make_Coord(size(local_shape_B), 1);
   auto c_coord_device = cutlass::make_Coord(size(local_shape_C), 1);
 
   // SYCL: allocation on each device (queue handles peer access internally)
+  std::cout << "[LOG] Allocating device tensors for " << TP_ << " devices" << std::endl;
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
     tensor_A_arr[device_idx].resize(a_coord_device);
     tensor_B_arr[device_idx].resize(b_coord_device);
     tensor_C_arr[device_idx].resize(c_coord_device);
     tensor_D_arr[device_idx].resize(c_coord_device);
+    std::cout << "[LOG] Device " << device_idx << " tensors allocated" << std::endl;
   }
+  std::cout << "[LOG] All device tensor allocations complete" << std::endl;
 }
 
 /// Commandline options -> Gemm/DistGemm Arguments
@@ -581,26 +590,33 @@ int run(Options &options) {
   size_t reference_workspace_size = Gemm::get_workspace_size(reference_arguments);
   reference_workspace = cutlass::device_memory::allocation<uint8_t>(reference_workspace_size);
 
+  std::cout << "[LOG] Running reference single-GPU GEMM..." << std::endl;
   CUTLASS_CHECK(reference_gemm.can_implement(reference_arguments));
   CUTLASS_CHECK(reference_gemm.initialize(reference_arguments, reference_workspace.get()));
   CUTLASS_CHECK(reference_gemm.run());
+  std::cout << "[LOG] Reference GEMM complete" << std::endl;
 
   using ElementBarrier = typename DistGemm::ElementBarrier;
   using ElementFlag = typename DistGemmKernel::ElementFlag;
 
   // Set up per-device queues (SYCL)
+  std::cout << "[LOG] Creating SYCL queues for " << TP_ << " devices" << std::endl;
   std::vector<sycl::queue*> stream_arr(TP_);
 
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
+    std::cout << "[LOG] Setting up device " << device_idx << std::endl;
+
     // Create queue for each GPU device
     // In SYCL, queues are created with device selectors
     auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
     if (device_idx >= static_cast<int>(devices.size())) {
       throw std::runtime_error("Not enough GPU devices available");
     }
-    std::cout << "[DEBUG] found device number is " << devices.size() << std::endl;
+    std::cout << "[LOG] Found " << devices.size() << " GPU devices on system" << std::endl;
     stream_arr[device_idx] = new sycl::queue(devices[device_idx]);
+    std::cout << "[LOG] Queue created for device " << device_idx << std::endl;
   }
+  std::cout << "[LOG] All SYCL queues created" << std::endl;
 
   // Instantiate DistGEMM
   DistGemm dist_gemm_arr[TP_];  // Distributed GEMM array for multiple devices
@@ -616,7 +632,9 @@ int run(Options &options) {
   // Create a structure of gemm kernel arguments suitable for invoking an instance of Gemm
   DistGemmArguments arguments_[TP_];
 
+  std::cout << "[LOG] Creating DistGEMM arguments for " << TP_ << " devices" << std::endl;
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
+    std::cout << "[LOG] Creating arguments for device " << device_idx << std::endl;
     arguments_[device_idx] = dist_gemm_args_from_options(options, device_idx);
 
     // Using the arguments, query for extra workspace required for matrix multiplication computation
@@ -631,14 +649,19 @@ int run(Options &options) {
     exclusive_workspace_ptr_arr[device_idx] = exclusive_workspace_arr[device_idx].get();
 
     // Zero out exclusive workspace - SYCL version uses queue fill operation
+    std::cout << "[LOG] Initializing workspace for device " << device_idx << std::endl;
     stream_arr[device_idx]->fill(exclusive_workspace_ptr_arr[device_idx], uint8_t(0), exclusive_workspace_size);
     stream_arr[device_idx]->wait();
   }
+  std::cout << "[LOG] All workspaces initialized" << std::endl;
 
+  std::cout << "[LOG] Initializing DistGEMM kernels" << std::endl;
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
+    std::cout << "[LOG] Checking implementation for device " << device_idx << std::endl;
     // Check if the problem size is supported or not
     CUTLASS_CHECK(dist_gemm_arr[device_idx].can_implement(arguments_[device_idx]));
 
+    std::cout << "[LOG] Initializing kernel for device " << device_idx << std::endl;
     // SYCL version does not use cudaGraphExec, no launch_with_pdl parameter
     CUTLASS_CHECK(dist_gemm_arr[device_idx].initialize(
           arguments_,
@@ -648,29 +671,48 @@ int run(Options &options) {
           stream_arr[device_idx]
           ));
 
+    std::cout << "[LOG] Kernel initialization complete for device " << device_idx << std::endl;
     stream_arr[device_idx]->wait();
   }
+  std::cout << "[LOG] All DistGEMM kernels initialized" << std::endl;
 
   // Correctness / Warmup iteration
   std::cout << std::endl << "  running DistGEMM..." << std::endl;
 
+  std::cout << "[LOG] Launching DistGEMM on all devices" << std::endl;
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
+    std::cout << "[LOG] Running kernel on device " << device_idx << std::endl;
     CUTLASS_CHECK(dist_gemm_arr[device_idx].run(stream_arr[device_idx]));
+    std::cout << "[LOG] Kernel submission finished on device " << device_idx << std::endl;
   }
+  std::cout << "[LOG] Waiting for all devices to complete" << std::endl;
   for (int device_idx = 0; device_idx < TP_; ++device_idx) {
-    stream_arr[device_idx]->wait();
+    std::cout << "[LOG] Synchronizing device " << device_idx << std::endl;
+    try {
+      stream_arr[device_idx]->wait_and_throw();
+      std::cout << "[LOG] Device " << device_idx << " queue completed" << std::endl;
+    } catch (sycl::exception const& e) {
+      std::cerr << "[LOG] Device " << device_idx << " queue wait failed: "
+                << e.what() << std::endl;
+      throw;
+    }
+    std::cout << "[LOG] Gathering results from device " << device_idx << std::endl;
     gather_results(options, device_idx);
+    std::cout << "[LOG] Results gathered from device " << device_idx << std::endl;
   }
+  std::cout << "[LOG] All results gathered" << std::endl;
 
-  std::cout << "  running DistGEMM finished without runtime errors" << std::endl;
+  std::cout << "[LOG] DistGEMM execution finished without runtime errors" << std::endl;
 
   //// Check if output from CUTLASS kernel and reference kernel are equal or not
+  std::cout << "[LOG] Verifying results..." << std::endl;
   Result result;
 
   result.passed = verify(options);
 
   std::cout << std::endl << "  Disposition (eps: " << options.eps << "): " << 
     (result.passed ? "Passed" : "Failed") << std::endl;
+  std::cout << "[LOG] Verification " << (result.passed ? "passed" : "failed") << std::endl;
 
   if (!result.passed) {
     exit(-1);
@@ -689,7 +731,9 @@ int run(Options &options) {
     }
 
     for (int device_idx = 0; device_idx < TP_; ++device_idx) {
-      stream_arr[device_idx]->wait();
+      std::cout << "[LOG] Warmup sync device " << device_idx << std::endl;
+      stream_arr[device_idx]->wait_and_throw();
+      std::cout << "[LOG] Warmup sync complete for device " << device_idx << std::endl;
     }
 
     // Benchmark
@@ -709,7 +753,9 @@ int run(Options &options) {
     
     for (int device_idx = 0; device_idx < TP_; ++device_idx) {
       // In SYCL, queues are in-order, so waiting on the queue ensures completion
-      stream_arr[device_idx]->wait();
+      std::cout << "[LOG] Profile sync device " << device_idx << std::endl;
+      stream_arr[device_idx]->wait_and_throw();
+      std::cout << "[LOG] Profile sync complete for device " << device_idx << std::endl;
     }
     
     end_time = std::chrono::high_resolution_clock::now();

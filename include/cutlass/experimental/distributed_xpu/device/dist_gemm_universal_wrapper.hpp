@@ -60,6 +60,7 @@
 #include "cutlass/experimental/distributed_xpu/device/full_barrier.hpp"
 #include "cutlass/experimental/distributed_xpu/device/detail.hpp"
 
+#include <iostream>
 #include <sycl/sycl.hpp>
 #include "cutlass/util/sycl_event_manager.hpp"
 
@@ -308,21 +309,33 @@ public:
 
     state_.device_idx = device_idx;
 
+    std::cout << "[DIST_INIT] device=" << device_idx
+              << " initialize begin, TP=" << TP_ << std::endl;
+
     for (int device = 0; device < TP_; ++device) {
       state_.device_barrier_ptrs[device] =
           reinterpret_cast<ElementBarrier*>(exclusive_workspace_ptrs[device]);
     }
 
     // Zero the exclusive workspace (barrier counter + flag array) for this device.
+    std::cout << "[DIST_INIT] device=" << device_idx
+              << " zeroing exclusive workspace bytes=" << get_exclusive_workspace_size()
+              << std::endl;
     Status status = zero_workspace(exclusive_workspace_ptrs[device_idx],
                                    get_exclusive_workspace_size(), stream, nullptr);
     if (status != Status::kSuccess) {
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " zero_workspace failed status=" << int(status) << std::endl;
       return status;
     }
+    std::cout << "[DIST_INIT] device=" << device_idx << " exclusive workspace cleared"
+              << std::endl;
 
     void** buffer_space = workspace_ptrs;
 
     for (int iteration = 0; iteration < TP_; ++iteration) {
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " iteration=" << iteration << " building slices" << std::endl;
       size_t   workspace_iter_offset = GemmKernel::get_workspace_size(args[device_idx]);
       uint8_t* workspace_ptr =
           reinterpret_cast<uint8_t*>(workspace_ptrs[device_idx]) +
@@ -359,19 +372,37 @@ public:
       void* peer_flag_ptr =
           exclusive_workspace_ptr_to_flag_ptr(exclusive_workspace_ptrs[flag_peer_idx], iteration);
 
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " iteration=" << iteration
+                << " peers(L,R)=" << left_peer_idx << "," << right_peer_idx
+                << " flag_peer=" << flag_peer_idx
+                << " self_flag_ptr=" << self_flag_ptr
+                << " peer_flag_ptr=" << peer_flag_ptr << std::endl;
+
       DistributedArguments distributed_args = {
           device_idx, iteration, self_flag_ptr, peer_flag_ptr};
       PackedArguments args_iter = {base_args, distributed_args};
 
       // Initialise workspace for this iteration
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " iteration=" << iteration << " initialize_workspace begin"
+                << std::endl;
       status = GemmKernel::initialize_workspace(args_iter, workspace_iter, stream);
       if (status != Status::kSuccess) {
+        std::cout << "[DIST_INIT] device=" << device_idx
+                  << " iteration=" << iteration
+                  << " initialize_workspace failed status=" << int(status) << std::endl;
         return status;
       }
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " iteration=" << iteration << " initialize_workspace complete"
+                << std::endl;
 
       // Store per-iteration params
       state_.params_array[iteration] =
           GemmKernel::to_underlying_arguments(args_iter, workspace_iter);
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " iteration=" << iteration << " params ready" << std::endl;
 
       // Record memcpy pointers (HasMemcpy schedules, iterations 1..TP-1)
       if (iteration > 0 && HasMemcpy) {
@@ -401,10 +432,19 @@ public:
         state_.memcpy_source_ptr_array[iteration] = local_ptr;
         state_.memcpy_remote_ptr_array[iteration] = remote_ptr;
         state_.memcpy_bytes[iteration]            = copy_size;
+
+        std::cout << "[DIST_INIT] device=" << device_idx
+                  << " iteration=" << iteration
+                  << " memcpy setup remote_peer=" << peer_idx_iter
+                  << " bytes=" << copy_size
+                  << " src=" << local_ptr
+                  << " remote=" << remote_ptr << std::endl;
       }
     } // for iteration
 
     state_.is_initialized = true;
+    std::cout << "[DIST_INIT] device=" << device_idx << " initialize complete"
+              << std::endl;
     return Status::kSuccess;
   }
 
@@ -439,18 +479,28 @@ public:
     }
 
     sycl::queue q = stream ? *stream : compat::get_default_queue();
+    std::cout << "[DIST_RUN] device=" << state.device_idx << " run begin" << std::endl;
 
     // 1. Full device barrier
     cutlass::Array<ElementFlag*, TP_> self_flag_ptrs;
     for (int iter = 0; iter < TP_; ++iter) {
       self_flag_ptrs[iter] = state.params_array[iter].distributed.self_flag_ptr_;
     }
+    std::cout << "[DIST_RUN] device=" << state.device_idx
+              << " submitting full barrier" << std::endl;
     launch_full_barrier<TP_, ElementBarrier, TP_, ElementFlag>(
         state.device_barrier_ptrs, self_flag_ptrs, state.device_idx, stream);
+    std::cout << "[DIST_RUN] device=" << state.device_idx
+              << " full barrier submitted" << std::endl;
 
     // 2. (HasMemcpy) Copy peer slices + signal flags
     if constexpr (HasMemcpy) {
       for (int iter = 1; iter < TP_; ++iter) {
+        std::cout << "[DIST_RUN] device=" << state.device_idx
+                  << " iteration=" << iter
+                  << " memcpy submit bytes=" << state.memcpy_bytes[iter]
+                  << " dst=" << state.memcpy_source_ptr_array[iter]
+                  << " src=" << state.memcpy_remote_ptr_array[iter] << std::endl;
         // Copy remote peer's slice into local buffer
         q.memcpy(state.memcpy_source_ptr_array[iter],
                  state.memcpy_remote_ptr_array[iter],
@@ -462,6 +512,10 @@ public:
         q.fill(reinterpret_cast<ElementFlag*>(
                    state.params_array[iter].distributed.peer_flag_ptr_),
                flag_val, size_t(1));
+        std::cout << "[DIST_RUN] device=" << state.device_idx
+                  << " iteration=" << iter
+                  << " signal submitted peer_flag_ptr="
+                  << state.params_array[iter].distributed.peer_flag_ptr_ << std::endl;
       }
     }
 
@@ -471,12 +525,22 @@ public:
     //    synchronisation is handled by the kernel-internal spin-wait
     //    (barrier_buffer in dist_gemm_kernel_wrapper.hpp).
     for (int iter = 0; iter < TP_; ++iter) {
+      std::cout << "[DIST_RUN] device=" << state.device_idx
+                << " iteration=" << iter << " DeviceGemm::run submit" << std::endl;
       Status status = DeviceGemm::run(state.params_array[iter], stream);
       if (status != Status::kSuccess) {
+        std::cout << "[DIST_RUN] device=" << state.device_idx
+                  << " iteration=" << iter
+                  << " DeviceGemm::run failed status=" << int(status) << std::endl;
         return status;
       }
+      std::cout << "[DIST_RUN] device=" << state.device_idx
+                << " iteration=" << iter << " DeviceGemm::run submitted"
+                << std::endl;
     }
 
+    std::cout << "[DIST_RUN] device=" << state.device_idx << " run submit complete"
+              << std::endl;
     return Status::kSuccess;
   }
 
