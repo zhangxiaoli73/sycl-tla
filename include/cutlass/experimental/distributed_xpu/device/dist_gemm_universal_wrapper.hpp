@@ -271,8 +271,10 @@ public:
                            ? buffer_space[peer_idx_iter]
                            : buffer_space[device_idx];
 
+    // [FIX] When RemoteC=true, we read from peer's D buffer, not C buffer
     uint8_t* tensor_buffer = reinterpret_cast<uint8_t*>(buffer_ptr) +
-        BufferHelper::get_buffer_offset_C(args.problem_shape);
+        (DistSchedule::RemoteC ? BufferHelper::get_buffer_offset_D(args.problem_shape)
+                               : BufferHelper::get_buffer_offset_C(args.problem_shape));
 
     return DistSchedule::get_tensor_C(tensor_C, tensor_buffer, device_idx, iteration);
   }
