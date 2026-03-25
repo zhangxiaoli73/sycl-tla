@@ -151,18 +151,18 @@ using DistSchedule = distributed::schedules::AllGather1D_TilingCD_RotatingA<TP>;
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // A matrix configuration
-using         ElementA    = cutlass::half_t;                                // Element type for A matrix operand
+using         ElementA    = cutlass::bfloat16_t;                             // Element type for A matrix operand
 using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
 constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
 
 // B matrix configuration
-using         ElementB    = cutlass::half_t;                                // Element type for B matrix operand
-using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
+using         ElementB    = cutlass::bfloat16_t;                             // Element type for B matrix operand
+using         LayoutB     = cutlass::layout::RowMajor;                      // Layout type for B matrix operand
 constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
 
 // C matrix configuration
-using         ElementC    = cutlass::half_t;                                // Element type for C and D matrix operands
-using         LayoutC     = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
+using         ElementC    = float;                                           // Element type for C and D matrix operands
+using         LayoutC     = cutlass::layout::RowMajor;                      // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
 
 // D matrix configuration
@@ -171,12 +171,12 @@ using         LayoutD     = LayoutC;
 constexpr int AlignmentD  = AlignmentC;
 
 // Core kernel configurations
-using ElementAccumulator  = cutlass::half_t;                                // Element type for internal accumulation
-using ElementCompute      = cutlass::half_t;                                // Element type for epilogue computation
-using ArchTag             = cutlass::arch::Xe20;                            // Intel Xe2 (BMG) architecture tag
-using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_256,_256,_32>;                           // Threadblock-level tile size
-using ClusterShape        = Shape<_1,_1,_1>;                                // Cluster shape
+using ElementAccumulator  = float;                                           // Element type for internal accumulation
+using ElementCompute      = float;                                           // Element type for epilogue computation
+using ArchTag             = cutlass::arch::Xe20;                             // Intel Xe20 architecture for optimized kernels
+using OperatorClass       = cutlass::arch::OpClassTensorOp;                  // TensorOp for Xe20
+using TileShape           = Shape<_256,_256,_32>;                            // Xe20 TensorOp-friendly tile shape
+using ClusterShape        = Shape<_1,_1,_1>;                                 // Cluster shape
 
 using KernelSchedule      = cutlass::gemm::collective::KernelScheduleAuto;
 using EpilogueSchedule    = cutlass::epilogue::collective::EpilogueScheduleAuto;
@@ -198,9 +198,7 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     ElementB, LayoutB, AlignmentB,
     ElementAccumulator,
     TileShape, ClusterShape,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))
-    >,
+    cutlass::gemm::collective::StageCountAuto,
     KernelSchedule
   >::CollectiveOp;
 
@@ -347,7 +345,7 @@ template <typename Element, typename Layout>
 bool initialize_tensor(
   cutlass::TensorView<Element, Layout> view,
   uint64_t seed,
-  bool is_device_tensor = false) {
+  bool /*is_device_tensor*/ = false) {
 
   double scope_max, scope_min;
   int bits = cutlass::sizeof_bits<Element>::value;
@@ -365,14 +363,8 @@ bool initialize_tensor(
     scope_min = -8;
   }
 
-  if (is_device_tensor) {
-    using Real = typename cutlass::RealType<Element>::Type;
-    cutlass::reference::device::TensorFillRandomUniform(
-      view, seed, static_cast<Real>(scope_max), static_cast<Real>(scope_min), 0);
-  } else {
-    cutlass::reference::host::TensorFillRandomUniform(
-      view, seed, scope_max, scope_min, 0);
-  }
+  cutlass::reference::host::TensorFillRandomUniform(
+    view, seed, scope_max, scope_min, 0);
 
   return true;
 }
@@ -402,9 +394,13 @@ void initialize(const Options &options) {
   tensor_D.resize(c_coord);
   tensor_ref_D.resize(c_coord);
 
-  initialize_tensor(tensor_A.device_view(), seed + 2022, /* is_device_tensor = */ true);
-  initialize_tensor(tensor_B.device_view(), seed + 2023, /* is_device_tensor = */ true);
-  initialize_tensor(tensor_C.device_view(), seed + 2024, /* is_device_tensor = */ true);
+  initialize_tensor(tensor_A.host_view(), seed + 2022);
+  initialize_tensor(tensor_B.host_view(), seed + 2023);
+  initialize_tensor(tensor_C.host_view(), seed + 2024);
+
+  tensor_A.sync_device();
+  tensor_B.sync_device();
+  tensor_C.sync_device();
 
   tensor_A.sync_host();
   tensor_B.sync_host();
@@ -452,47 +448,57 @@ using DistGemmArguments = typename DistGemm::Arguments;
 DistGemmArguments dist_gemm_args_from_options(
     const Options &options,
     int device_idx) {
-
   auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
 
-  auto global_A = cute::make_tensor(tensor_A.device_data(),
-      cute::make_layout(cute::make_shape(options.m, options.k, options.l), stride_A));
-  auto global_B = cute::make_tensor(tensor_B.device_data(),
-      cute::make_layout(cute::make_shape(options.n, options.k, options.l), stride_B));
-  auto global_C = cute::make_tensor(tensor_C.device_data(),
-      cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_C));
-
-  auto global_A_device_slice = DistSchedule::get_device_slice_A(global_A, device_idx);
-  auto global_B_device_slice = DistSchedule::get_device_slice_B(global_B, device_idx);
-  auto global_C_device_slice = DistSchedule::get_device_slice_C(global_C, device_idx);
+  // This path currently assumes batch size 1 for host-side slice bootstrap.
+  if (options.l != 1) {
+    throw std::runtime_error("65_distributed_gemm currently supports l == 1 in SYCL bootstrap path");
+  }
 
   auto local_shape_A = DistSchedule::get_local_a_shape(problem_shape);
   auto local_shape_B = DistSchedule::get_local_b_shape(problem_shape);
   auto local_shape_C = DistSchedule::get_local_c_shape(problem_shape);
   auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
 
-  auto local_stride_A = cutlass::make_cute_packed_stride(StrideA{}, local_shape_A);
-  auto local_stride_B = cutlass::make_cute_packed_stride(StrideB{}, local_shape_B);
-  auto local_stride_C = cutlass::make_cute_packed_stride(StrideC{}, local_shape_C);
-  auto local_stride_D = cutlass::make_cute_packed_stride(StrideD{}, local_shape_D);
+  int local_M = static_cast<int>(cute::size<0>(local_shape_A));
+  int local_K = static_cast<int>(cute::size<1>(local_shape_A));
+  int local_N = static_cast<int>(cute::size<0>(local_shape_B));
+
+  auto local_shape_A_mkl = cute::make_shape(local_M, local_K, options.l);
+  auto local_shape_B_nkl = cute::make_shape(local_N, local_K, options.l);
+  auto local_shape_C_mnl = cute::make_shape(local_M, local_N, options.l);
+  auto local_shape_D_mnl = cute::make_shape(local_M, local_N, options.l);
+
+  auto local_stride_A = cutlass::make_cute_packed_stride(StrideA{}, local_shape_A_mkl);
+  auto local_stride_B = cutlass::make_cute_packed_stride(StrideB{}, local_shape_B_nkl);
+  auto local_stride_C = cutlass::make_cute_packed_stride(StrideC{}, local_shape_C_mnl);
+  auto local_stride_D = cutlass::make_cute_packed_stride(StrideD{}, local_shape_D_mnl);
 
   auto local_A = cute::make_tensor(
       tensor_A_arr[device_idx].device_data(),
-      make_layout(local_shape_A, local_stride_A));
+      make_layout(local_shape_A_mkl, local_stride_A));
   auto local_B = cute::make_tensor(
       tensor_B_arr[device_idx].device_data(),
-      make_layout(local_shape_B, local_stride_B));
+      make_layout(local_shape_B_nkl, local_stride_B));
   auto local_C = cute::make_tensor(
       tensor_C_arr[device_idx].device_data(),
-      make_layout(local_shape_C, local_stride_C));
+      make_layout(local_shape_C_mnl, local_stride_C));
   auto local_D = cute::make_tensor(
       tensor_D_arr[device_idx].device_data(),
-      make_layout(local_shape_D, local_stride_D));
+      make_layout(local_shape_D_mnl, local_stride_D));
 
-  // Copy over tensor tiles for the first iteration
-  cutlass::device_copy(global_A_device_slice, local_A);
-  cutlass::device_copy(global_B_device_slice, local_B);
-  cutlass::device_copy(global_C_device_slice, local_C);
+  // Copy over tensor tiles for the first iteration.
+  // For AllGather1D_TilingCD_RotatingA: A and C are sharded along M, B is replicated.
+  std::size_t a_tile_elems = static_cast<std::size_t>(local_M) * local_K;
+  std::size_t b_tile_elems = static_cast<std::size_t>(local_N) * local_K;
+  std::size_t c_tile_elems = static_cast<std::size_t>(local_M) * local_N;
+
+  std::size_t a_offset = static_cast<std::size_t>(device_idx) * a_tile_elems;
+  std::size_t c_offset = static_cast<std::size_t>(device_idx) * c_tile_elems;
+
+  compat::memcpy(local_A.data(), tensor_A.device_data() + a_offset, a_tile_elems * sizeof(ElementA));
+  compat::memcpy(local_B.data(), tensor_B.device_data(),             b_tile_elems * sizeof(ElementB));
+  compat::memcpy(local_C.data(), tensor_C.device_data() + c_offset, c_tile_elems * sizeof(ElementC));
 
   DistGemmArguments arguments{
     cutlass::gemm::GemmUniversalMode::kGemm,                                       // mode
@@ -510,7 +516,7 @@ DistGemmArguments dist_gemm_args_from_options(
       },
       reinterpret_cast<const ElementC*>(local_C.data()),
       local_C.stride(),
-      reinterpret_cast<const ElementD*>(local_D.data()),
+      reinterpret_cast<ElementD*>(local_D.data()),
       local_D.stride(),
     },                                                                             // epilogue
     {},                                                                            // hw_info
@@ -522,24 +528,22 @@ DistGemmArguments dist_gemm_args_from_options(
 
 // Gathers results, moves back to the original full-sized D tensor.
 void gather_results(const Options &options, int device_idx) {
-
   auto problem_shape = cute::make_tuple(options.m, options.n, options.k, options.l);
 
-  // Global dest
-  auto global_D = cute::make_tensor(tensor_D.device_data(),
-      cute::make_layout(cute::make_shape(options.m, options.n, options.l), stride_D));
-  auto global_D_device_slice = DistSchedule::get_device_slice_D(global_D, device_idx);
+  if (options.l != 1) {
+    throw std::runtime_error("65_distributed_gemm currently supports l == 1 in SYCL bootstrap path");
+  }
 
-  // Device_idx local dest
   auto local_shape_D = DistSchedule::get_local_d_shape(problem_shape);
-  auto local_stride_D = cutlass::make_cute_packed_stride(StrideD{}, local_shape_D);
-  auto local_D = cute::make_tensor(
-      tensor_D_arr[device_idx].device_data(),
-      make_layout(local_shape_D, local_stride_D)
-  );
+  int local_M = static_cast<int>(cute::size<0>(local_shape_D));
+  int local_N = static_cast<int>(cute::size<1>(local_shape_D));
 
-  // Copy to global dest
-  cutlass::device_copy(local_D, global_D_device_slice);
+  std::size_t d_tile_elems = static_cast<std::size_t>(local_M) * local_N;
+  std::size_t d_offset = static_cast<std::size_t>(device_idx) * d_tile_elems;
+
+  compat::memcpy(tensor_D.device_data() + d_offset,
+                 tensor_D_arr[device_idx].device_data(),
+                 d_tile_elems * sizeof(ElementD));
 }
 
 bool verify(const Options &options) {
@@ -616,7 +620,7 @@ int run(Options &options) {
     arguments_[device_idx] = dist_gemm_args_from_options(options, device_idx);
 
     // Using the arguments, query for extra workspace required for matrix multiplication computation
-    size_t workspace_size = DistGemm::get_workspace_size(arguments_, device_idx);
+    size_t workspace_size = DistGemm::get_workspace_size(arguments_[device_idx]);
     size_t exclusive_workspace_size = DistGemm::get_exclusive_workspace_size();
 
     workspace_arr[device_idx] = cutlass::device_memory::allocation<uint8_t>(workspace_size);
@@ -718,8 +722,9 @@ int run(Options &options) {
     double avg_runtime_s = (double)(result.avg_runtime_ms / 1000.0);
     result.tflops = options.tflops(avg_runtime_s);
 
-    auto [local_M, local_N, local_K, local_L] = DistSchedule::get_local_gemm_shape(
+    auto [local_M, local_N, local_K] = DistSchedule::get_local_gemm_shape(
         cute::make_tuple(options.m, options.n, options.k, options.l));
+    int local_L = options.l;
 
     std::cout << std::endl;
     std::cout << "  TP: " << TP::value << std::endl;

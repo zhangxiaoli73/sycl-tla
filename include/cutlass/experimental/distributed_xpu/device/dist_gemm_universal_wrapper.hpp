@@ -174,7 +174,13 @@ public:
       return Status::kInvalid;
     }
     Arguments args_copy = args;
-    args_copy.problem_shape = DistSchedule::get_local_gemm_shape(args.problem_shape);
+    auto local_shape = DistSchedule::get_local_gemm_shape(args.problem_shape);
+    args_copy.problem_shape = cute::make_tuple(
+        cute::size<0>(local_shape),
+        cute::size<1>(local_shape),
+        cute::size<2>(local_shape),
+        cute::size<3>(args.problem_shape)
+    );
     for (int iteration = 0; iteration < TP_; ++iteration) {
       if (not GemmKernel::can_implement(args_copy)) {
         return Status::kInvalid;
@@ -332,20 +338,14 @@ public:
       auto tensor_d_iter = get_tensor_D_for_iter(args, buffer_space, device_idx, iteration);
 
       Arguments base_args      = args[device_idx];
-      base_args.problem_shape  = DistSchedule::get_local_gemm_shape(args[device_idx].problem_shape);
-      base_args.mainloop = {
-          reinterpret_cast<const ElementA*>(tensor_a_iter.data()),
-          tensor_a_iter.stride(),
-          reinterpret_cast<const ElementB*>(tensor_b_iter.data()),
-          tensor_b_iter.stride()
-      };
-      base_args.epilogue = {
-          base_args.epilogue.thread,
-          reinterpret_cast<const ElementC*>(tensor_c_iter.data()),
-          tensor_c_iter.stride(),
-          reinterpret_cast<ElementD*>(tensor_d_iter.data()),
-          tensor_d_iter.stride()
-      };
+      auto local_shape = DistSchedule::get_local_gemm_shape(args[device_idx].problem_shape);
+      // Update problem_shape to reflect local dimensions (M, N, K stay local, L stays original)
+      base_args.problem_shape = cute::make_tuple(
+          cute::size<0>(local_shape),
+          cute::size<1>(local_shape),
+          cute::size<2>(local_shape),
+          cute::size<3>(args[device_idx].problem_shape)
+      );
 
       if constexpr (DistSchedule::RemoteC) {
         base_args.epilogue.thread.beta = (iteration == 0) ? 0.0f : 1.0f;

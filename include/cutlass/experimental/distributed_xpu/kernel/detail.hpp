@@ -54,11 +54,11 @@ CUTLASS_DEVICE
 void ld_without_cache(uint64_t& val, void const* ptr) {
 #if defined(__SYCL_DEVICE_ONLY__)
   sycl::atomic_ref<uint64_t,
-                   sycl::memory_order::acquire,
+                   sycl::memory_order::acq_rel,
                    sycl::memory_scope::system,
                    sycl::access::address_space::global_space>
       ref(*reinterpret_cast<uint64_t*>(const_cast<void*>(ptr)));
-  val = ref.load();
+  val = ref.load(sycl::memory_order::acquire);
 #else
   val = *reinterpret_cast<const uint64_t*>(ptr);
 #endif
@@ -70,11 +70,11 @@ CUTLASS_DEVICE
 void ld_without_cache(uint32_t& val, void const* ptr) {
 #if defined(__SYCL_DEVICE_ONLY__)
   sycl::atomic_ref<uint32_t,
-                   sycl::memory_order::acquire,
+                   sycl::memory_order::acq_rel,
                    sycl::memory_scope::system,
                    sycl::access::address_space::global_space>
       ref(*reinterpret_cast<uint32_t*>(const_cast<void*>(ptr)));
-  val = ref.load();
+  val = ref.load(sycl::memory_order::acquire);
 #else
   val = *reinterpret_cast<const uint32_t*>(ptr);
 #endif

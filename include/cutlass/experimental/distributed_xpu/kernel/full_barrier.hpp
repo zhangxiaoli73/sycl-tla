@@ -118,14 +118,14 @@ void full_barrier_kernel_impl(
   // 3. Spin until our local arrival counter reaches NP-1.
   IntType max_val = static_cast<IntType>(NP - 1);
   sycl::atomic_ref<IntType,
-                   sycl::memory_order::acquire,
+                   sycl::memory_order::acq_rel,
                    sycl::memory_scope::system,
                    sycl::access::address_space::global_space>
       local_ref(*device_arrival_ptrs[device_idx]);
 
-  IntType curr_val = local_ref.load();
+  IntType curr_val = local_ref.load(sycl::memory_order::acquire);
   while (curr_val < max_val) {
-    curr_val = local_ref.load();
+    curr_val = local_ref.load(sycl::memory_order::acquire);
   }
 
   // 4. Reset our local counter.

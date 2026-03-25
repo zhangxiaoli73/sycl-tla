@@ -234,11 +234,11 @@ struct DistributedGemmKernelWrapper<
                       (params.distributed.iteration > 0);
       if (is_first) {
         sycl::atomic_ref<ElementFlag,
-                         sycl::memory_order::release,
+                         sycl::memory_order::acq_rel,
                          sycl::memory_scope::system,
                          sycl::access::address_space::global_space>
             flag_ref(*reinterpret_cast<ElementFlag*>(params.distributed.peer_flag_ptr_));
-        flag_ref.store(ElementFlag(1));
+        flag_ref.store(ElementFlag(1), sycl::memory_order::release);
       }
 #endif
     }
