@@ -594,6 +594,7 @@ int run(Options &options) {
     if (device_idx >= static_cast<int>(devices.size())) {
       throw std::runtime_error("Not enough GPU devices available");
     }
+    std::cout << "[DEBUG] found device number is " << devices.size() << std::endl;
     stream_arr[device_idx] = new sycl::queue(devices[device_idx]);
   }
 

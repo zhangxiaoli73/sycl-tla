@@ -8,7 +8,7 @@ Please refer to [REQUIREMENTS.md](REQUIREMENTS.md) for more information.
 
 By default, the example assumes 8 GPUs (TP=8) and runs an All Gather + GEMM operation, which rotates
 operand A. To run with a different number of GPUs or schedule, please refer to
-[65_distributed_gemm.cu](65_distributed_gemm.cu).
+[65_distributed_gemm.cu](65_distributed_gemm.cpp).
 
 
 ## Getting started
