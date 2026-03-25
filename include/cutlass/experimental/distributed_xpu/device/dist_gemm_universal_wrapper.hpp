@@ -118,6 +118,8 @@ public:
   static constexpr bool HasMemcpy = DistSchedule::HasMemcpy;
   using TP        = typename DistSchedule::TP;
   static constexpr int TP_ = TP{};
+    static constexpr bool EnableSingleLaunchWorkgroupOverlap =
+      DistSchedule::KernelWritesArrivalFlag && !HasMemcpy && (TP_ > 1);
 
   using ElementFlag    = typename GemmKernel::ElementFlag;
   using ElementBarrier = uint32_t;
@@ -148,6 +150,11 @@ public:
     size_t       memcpy_bytes[TP_];
 
     cutlass::Array<ElementBarrier*, TP_> device_barrier_ptrs;
+
+    // Single-launch mode state
+    Params       single_launch_params;
+    ElementFlag* workgroup_flags_ptr = nullptr;
+    int          workgroup_count = 1;
 
     bool is_initialized = false;
   };
@@ -206,7 +213,37 @@ public:
     for (int iteration = 0; iteration < TP_; ++iteration) {
       workspace_bytes += GemmKernel::get_workspace_size(args);
     }
+    if constexpr (EnableSingleLaunchWorkgroupOverlap) {
+      workspace_bytes += get_workgroup_flag_bytes(args);
+    }
     return workspace_bytes;
+  }
+
+  static int
+  estimate_workgroup_count(Arguments const& args) {
+    auto local_shape = DistSchedule::get_local_gemm_shape(args.problem_shape);
+    int local_m = static_cast<int>(cute::size<0>(local_shape));
+    int local_n = static_cast<int>(cute::size<1>(local_shape));
+    int local_l = static_cast<int>(cute::size<3>(args.problem_shape));
+
+    int tb_m = static_cast<int>(ThreadblockShape::kM);
+    int tb_n = static_cast<int>(ThreadblockShape::kN);
+    int grid_m = cute::ceil_div(local_m, tb_m);
+    int grid_n = cute::ceil_div(local_n, tb_n);
+
+    int wg_count = grid_m * grid_n * local_l;
+    return (wg_count > 0) ? wg_count : 1;
+  }
+
+  static size_t
+  get_workgroup_flag_bytes(Arguments const& args) {
+    int wg_count = estimate_workgroup_count(args);
+    return round_nearest(sizeof(ElementFlag) * size_t(TP_) * size_t(wg_count), 32);
+  }
+
+  static size_t
+  get_workgroup_flag_offset(Arguments const& args) {
+    return get_buffer_space_size(args) + (size_t(TP_) * GemmKernel::get_workspace_size(args));
   }
 
   static size_t get_barrier_bytes() {
@@ -335,6 +372,24 @@ public:
 
     void** buffer_space = workspace_ptrs;
 
+    if constexpr (EnableSingleLaunchWorkgroupOverlap) {
+      state_.workgroup_count = estimate_workgroup_count(args[device_idx]);
+      size_t wg_flag_offset = get_workgroup_flag_offset(args[device_idx]);
+      state_.workgroup_flags_ptr = reinterpret_cast<ElementFlag*>(
+          reinterpret_cast<uint8_t*>(workspace_ptrs[device_idx]) + wg_flag_offset);
+
+      size_t wg_flag_bytes = get_workgroup_flag_bytes(args[device_idx]);
+      std::cout << "[DIST_INIT] device=" << device_idx
+                << " single-launch mode, workgroup_count=" << state_.workgroup_count
+                << " flag_bytes=" << wg_flag_bytes << std::endl;
+      status = zero_workspace(state_.workgroup_flags_ptr, wg_flag_bytes, stream, nullptr);
+      if (status != Status::kSuccess) {
+        std::cout << "[DIST_INIT] device=" << device_idx
+                  << " single-launch flag zero failed status=" << int(status) << std::endl;
+        return status;
+      }
+    }
+
     for (int iteration = 0; iteration < TP_; ++iteration) {
       std::cout << "[DIST_INIT] device=" << device_idx
                 << " iteration=" << iteration << " building slices" << std::endl;
@@ -444,6 +499,32 @@ public:
       }
     } // for iteration
 
+    if constexpr (EnableSingleLaunchWorkgroupOverlap) {
+      // Build a packed single-launch parameter object with per-iteration params.
+      state_.single_launch_params = state_.params_array[0];
+      state_.single_launch_params.single_launch_mode = true;
+      // Single-launch simplified mode: execute one distributed stage per launch.
+      state_.single_launch_params.iteration_count = 1;
+      state_.single_launch_params.workgroup_count = state_.workgroup_count;
+
+      size_t wg_flag_offset = get_workgroup_flag_offset(args[device_idx]);
+      auto [left_peer_idx, right_peer_idx] = DistSchedule::get_peers_for_device(device_idx);
+      int flag_peer_idx = DistSchedule::KernelWritesArrivalFlag ? right_peer_idx : device_idx;
+
+      ElementFlag* peer_wg_flag_base = reinterpret_cast<ElementFlag*>(
+          reinterpret_cast<uint8_t*>(workspace_ptrs[flag_peer_idx]) + wg_flag_offset);
+
+      for (int iteration = 0; iteration < TP_; ++iteration) {
+        state_.single_launch_params.base_params_array[iteration] =
+            state_.params_array[iteration].base;
+
+        auto dist_iter = state_.params_array[iteration].distributed;
+        dist_iter.self_flag_ptr_ = state_.workgroup_flags_ptr + (iteration * state_.workgroup_count);
+        dist_iter.peer_flag_ptr_ = peer_wg_flag_base + (iteration * state_.workgroup_count);
+        state_.single_launch_params.distributed_params_array[iteration] = dist_iter;
+      }
+    }
+
     state_.is_initialized = true;
     std::cout << "[DIST_INIT] device=" << device_idx << " initialize complete"
               << std::endl;
@@ -521,7 +602,25 @@ public:
       }
     }
 
-    // 3. Submit per-iteration GEMM kernels in order.
+    // 3. Submit GEMM kernels.
+    if constexpr (EnableSingleLaunchWorkgroupOverlap) {
+      std::cout << "[DIST_RUN] device=" << state.device_idx
+                << " single-launch DeviceGemm::run submit" << std::endl;
+      Status status = DeviceGemm::run(state.single_launch_params, stream);
+      if (status != Status::kSuccess) {
+        std::cout << "[DIST_RUN] device=" << state.device_idx
+                  << " single-launch DeviceGemm::run failed status=" << int(status)
+                  << std::endl;
+        return status;
+      }
+      std::cout << "[DIST_RUN] device=" << state.device_idx
+                << " single-launch DeviceGemm::run submitted" << std::endl;
+      std::cout << "[DIST_RUN] device=" << state.device_idx << " run submit complete"
+                << std::endl;
+      return Status::kSuccess;
+    }
+
+    // Legacy path: submit per-iteration GEMM kernels in order.
     //    Because the SYCL queue is in-order, each iteration starts only after
     //    the preceding one completes on this device.  Cross-device
     //    synchronisation is handled by the kernel-internal spin-wait

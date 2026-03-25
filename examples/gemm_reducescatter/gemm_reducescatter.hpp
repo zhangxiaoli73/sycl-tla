@@ -1,4 +1,4 @@
-#include "allreduce.hpp"
+#include "reducescatter.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -132,7 +132,6 @@ void gemm_device(ATensor const& A, // (M,K)
 
   /* Write C to global memory */
   copy(copy_c, tCrC, tCgC);
-  // TODO: prefetch or query barrier for next run
 }
 
 template <class ATensor, class BTensor, class CTensor, class TiledMMA>
@@ -140,9 +139,9 @@ void gemm_device_fused(ATensor const& A,
                                              BTensor const& B,
                                              CTensor& C,
                                              TiledMMA const& mma,
-                                             typename CTensor::element_type** ipc_c_ptrs,
-                                             int** ipc_signal_ptrs,
-                                             int** ipc_ack_ptrs,
+                                             typename CTensor::element_type** ipc_c_ptrs, //remote C
+                                             int** ipc_signal_ptrs, // remote flag
+                                             int** ipc_ack_ptrs, // remote ack flag
                                              typename CTensor::element_type* send_local,
                                              int rank,
                                              int world_size,

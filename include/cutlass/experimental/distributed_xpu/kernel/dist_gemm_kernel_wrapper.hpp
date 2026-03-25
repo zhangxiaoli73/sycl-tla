@@ -129,6 +129,13 @@ struct DistributedGemmKernelWrapper<
   struct PackedParams {
     BaseParams        base{};
     DistributedParams distributed{};
+
+    // Single-launch mode: run multiple distributed iterations inside one kernel launch.
+    cutlass::Array<BaseParams, TP{}>        base_params_array{};
+    cutlass::Array<DistributedParams, TP{}> distributed_params_array{};
+    int                                     iteration_count = 1;
+    int                                     workgroup_count = 1;
+    bool                                    single_launch_mode = false;
   };
 
   using Params = PackedParams;
@@ -150,7 +157,15 @@ struct DistributedGemmKernelWrapper<
         reinterpret_cast<ElementFlag*>(args.distributed.peer_flag_ptr)
     };
 
-    return {kernel_params, dist_params};
+    PackedParams packed{};
+    packed.base = kernel_params;
+    packed.distributed = dist_params;
+    packed.base_params_array[0] = kernel_params;
+    packed.distributed_params_array[0] = dist_params;
+    packed.iteration_count = 1;
+    packed.workgroup_count = 1;
+    packed.single_launch_mode = false;
+    return packed;
   }
 
   static bool
@@ -220,6 +235,21 @@ struct DistributedGemmKernelWrapper<
     }
   }
 
+  CUTLASS_DEVICE
+  void
+  barrier_buffer_workgroup(DistributedParams const& dist_params, int workgroup_idx, int iteration) {
+    if (iteration > 0) {
+      using detail::ld_without_cache;
+
+      ElementFlag* self_flag_ptr = dist_params.self_flag_ptr_ + workgroup_idx;
+      ElementFlag comm_iter = 0;
+      ld_without_cache(comm_iter, self_flag_ptr);
+      while (comm_iter == 0) {
+        ld_without_cache(comm_iter, self_flag_ptr);
+      }
+    }
+  }
+
   // Write the peer's arrival flag (1) from the first work-item of the first
   // work-group.  Uses a release-scoped atomic store so the write is visible
   // to the peer's cross-device spin-wait.
@@ -244,6 +274,26 @@ struct DistributedGemmKernelWrapper<
     }
   }
 
+  CUTLASS_DEVICE
+  void
+  maybe_signal_arrival_workgroup(DistributedParams const& next_dist_params, int workgroup_idx, int iteration_count) {
+    if constexpr (KernelWritesArrivalFlag) {
+#if defined(__SYCL_DEVICE_ONLY__)
+      auto item = compat::get_nd_item<3>();
+      bool is_first_lane = (item.get_local_linear_id() == 0);
+      if (is_first_lane && iteration_count > 1) {
+        ElementFlag* peer_flag_ptr = next_dist_params.peer_flag_ptr_ + workgroup_idx;
+        sycl::atomic_ref<ElementFlag,
+                         sycl::memory_order::acq_rel,
+                         sycl::memory_scope::system,
+                         sycl::access::address_space::global_space>
+            flag_ref(*peer_flag_ptr);
+        flag_ref.store(ElementFlag(1), sycl::memory_order::release);
+      }
+#endif
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Kernel entry point
   // -------------------------------------------------------------------------
@@ -256,15 +306,35 @@ struct DistributedGemmKernelWrapper<
     arch::launch_dependent_grids();
     arch::wait_on_dependent_grids();
 
-    // Optionally write arrival flag for the previous stage/iteration.
-    maybe_signal_arrival(params);
+    if (!params.single_launch_mode) {
+      // Optionally write arrival flag for the previous stage/iteration.
+      maybe_signal_arrival(params);
 
-    // Spin-wait until the local buffer is ready (filled by memcpy or peer GEMM).
-    barrier_buffer(params);
+      // Spin-wait until the local buffer is ready (filled by memcpy or peer GEMM).
+      barrier_buffer(params);
 
-    // Execute the local GEMM.
+      // Execute the local GEMM.
+      BaseKernel gemm;
+      gemm(params.base, smem_buf);
+      return;
+    }
+
+    // Single-launch mode: each workgroup walks distributed iterations locally,
+    // synchronizing with its peer workgroup via per-workgroup flags.
+#if defined(__SYCL_DEVICE_ONLY__)
+    auto item = compat::get_nd_item<3>();
+    int workgroup_idx = static_cast<int>(item.get_group_linear_id());
+#else
+    int workgroup_idx = 0;
+#endif
+
     BaseKernel gemm;
-    gemm(params.base, smem_buf);
+    auto const& iter_base = params.base_params_array[0];
+    auto const& iter_dist = params.distributed_params_array[0];
+
+    // single_launch_mode currently runs one distributed stage per launch.
+    barrier_buffer_workgroup(iter_dist, workgroup_idx, 0);
+    gemm(iter_base, smem_buf);
   }
 };
 
