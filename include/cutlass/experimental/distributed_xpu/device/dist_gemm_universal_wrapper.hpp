@@ -60,10 +60,8 @@
 #include "cutlass/experimental/distributed_xpu/device/full_barrier.hpp"
 #include "cutlass/experimental/distributed_xpu/device/detail.hpp"
 
-#if defined(CUTLASS_ENABLE_SYCL)
 #include <sycl/sycl.hpp>
 #include "cutlass/util/sycl_event_manager.hpp"
-#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -440,7 +438,6 @@ public:
       return Status::kErrorInternal;
     }
 
-#if defined(CUTLASS_ENABLE_SYCL)
     sycl::queue q = stream ? *stream : compat::get_default_queue();
 
     // 1. Full device barrier
@@ -481,11 +478,6 @@ public:
     }
 
     return Status::kSuccess;
-#else
-    (void)state; (void)stream;
-    CUTLASS_TRACE_HOST("  DistributedGemmXpu requires CUTLASS_ENABLE_SYCL.");
-    return Status::kErrorInternal;
-#endif
   }
 
   // -------------------------------------------------------------------------

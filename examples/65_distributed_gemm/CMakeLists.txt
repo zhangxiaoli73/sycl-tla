@@ -26,9 +26,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-if (CUTLASS_NVCC_ARCHS MATCHES 90a)
-cutlass_example_add_executable(
-  65_distributed_gemm
-  65_distributed_gemm.cu
+if(CUTLASS_ENABLE_SYCL AND SYCL_INTEL_TARGET)
+  cutlass_example_add_executable(
+    65_distributed_gemm
+    65_distributed_gemm.cpp
   )
+else()
+  message(STATUS "Skipping 65_distributed_gemm: requires CUTLASS_ENABLE_SYCL=ON and SYCL_INTEL_TARGET")
 endif()

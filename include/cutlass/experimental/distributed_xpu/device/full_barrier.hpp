@@ -45,10 +45,8 @@
 
 #include "cutlass/experimental/distributed_xpu/kernel/full_barrier.hpp"
 
-#if defined(CUTLASS_ENABLE_SYCL)
 #include <sycl/sycl.hpp>
 #include "cutlass/util/sycl_event_manager.hpp"
-#endif
 
 namespace cutlass::distributed_xpu::device {
 
@@ -70,7 +68,6 @@ void launch_full_barrier(
     IntType                                device_idx,
     cudaStream_t                           stream)
 {
-#if defined(CUTLASS_ENABLE_SYCL)
   sycl::queue q = stream ? *stream : compat::get_default_queue();
 
   auto e = q.single_task([=]() {
@@ -82,7 +79,6 @@ void launch_full_barrier(
   });
 
   EventManager::getInstance().addEvent(e);
-#endif // CUTLASS_ENABLE_SYCL
 }
 
 } // namespace cutlass::distributed_xpu::device

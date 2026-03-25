@@ -42,9 +42,7 @@
 
 #include "cutlass/cutlass.h"
 
-#if defined(CUTLASS_ENABLE_SYCL)
 #include <sycl/sycl.hpp>
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 

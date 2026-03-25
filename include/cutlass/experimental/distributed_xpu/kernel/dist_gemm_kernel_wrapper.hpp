@@ -59,9 +59,7 @@
 
 #include "cutlass/experimental/distributed_xpu/kernel/detail.hpp"
 
-#if defined(CUTLASS_ENABLE_SYCL)
 #include <sycl/sycl.hpp>
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -241,12 +239,6 @@ struct DistributedGemmKernelWrapper<
                          sycl::access::address_space::global_space>
             flag_ref(*reinterpret_cast<ElementFlag*>(params.distributed.peer_flag_ptr_));
         flag_ref.store(ElementFlag(1));
-      }
-#else
-      if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
-          threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0 &&
-          params.distributed.iteration > 0) {
-        *reinterpret_cast<ElementFlag*>(params.distributed.peer_flag_ptr_) = 1;
       }
 #endif
     }

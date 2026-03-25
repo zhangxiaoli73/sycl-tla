@@ -32,8 +32,8 @@
 /*! \file
     \brief Distributed GEMM device layer helpers — XPU/SYCL version.
 
-    check_cuda_status() and DistGemmBufferHelper are architecture-neutral;
-    this file simply re-exposes them in the cutlass::distributed_xpu::device::detail
+  DistGemmBufferHelper is architecture-neutral;
+  this file simply re-exposes it in the cutlass::distributed_xpu::device::detail
     namespace so that the XPU device adapter can use them without pulling in
     CUDA-only headers.
 */
@@ -47,16 +47,6 @@
 ///////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::distributed_xpu::device::detail {
-
-// On SYCL, cudaError_t / cudaSuccess are shimmed in cutlass/gpu_generics.h.
-inline cutlass::Status check_cuda_status(cudaError_t status) {
-  if (status != cudaSuccess) {
-    auto result = cudaGetLastError();
-    CUTLASS_TRACE_HOST("  error message: " << cudaGetErrorString(result));
-    return cutlass::Status::kErrorInternal;
-  }
-  return cutlass::Status::kSuccess;
-}
 
 // DistGemmBufferHelper computes required buffer sizes and byte offsets for all
 // GEMM operand buffers.  No CUDA/SYCL API is used here.

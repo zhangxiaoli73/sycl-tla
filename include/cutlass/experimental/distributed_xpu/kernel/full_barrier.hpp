@@ -54,9 +54,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/array.h"
 
-#if defined(CUTLASS_ENABLE_SYCL)
 #include <sycl/sycl.hpp>
-#endif
 
 #include "cutlass/experimental/distributed_xpu/kernel/detail.hpp"
 

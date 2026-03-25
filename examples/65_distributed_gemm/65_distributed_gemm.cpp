@@ -173,13 +173,13 @@ constexpr int AlignmentD  = AlignmentC;
 // Core kernel configurations
 using ElementAccumulator  = cutlass::half_t;                                // Element type for internal accumulation
 using ElementCompute      = cutlass::half_t;                                // Element type for epilogue computation
-using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
+using ArchTag             = cutlass::arch::Xe20;                            // Intel Xe2 (BMG) architecture tag
 using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
-using TileShape           = Shape<_128,_256,_64>;                           // Threadblock-level tile size
-using ClusterShape        = Shape<_1,_2,_1>;                                // Shape of the threadblocks in a cluster
+using TileShape           = Shape<_256,_256,_32>;                           // Threadblock-level tile size
+using ClusterShape        = Shape<_1,_1,_1>;                                // Cluster shape
 
-using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedPingpong;
-using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecialized;
+using KernelSchedule      = cutlass::gemm::collective::KernelScheduleAuto;
+using EpilogueSchedule    = cutlass::epilogue::collective::EpilogueScheduleAuto;
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
