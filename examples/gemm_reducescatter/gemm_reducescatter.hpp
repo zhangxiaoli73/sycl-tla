@@ -385,6 +385,7 @@ class GemmAllReduce {
         TC* c_ptr = C.data().get();
 
         int world_size = ar_op.get_world_size();
+        int rank = ar_op.get_rank();
         int m = ar_op.get_m();
         int n = ar_op.get_n();
         int tile_m = int(get<0>(mma.tile_mnk()));
@@ -395,6 +396,7 @@ class GemmAllReduce {
 
         // If C pointer changed or tile shape changed, rebuild IPC resources.
         if (fused_ipc_initialized_ && (local_c_ptr_ != c_ptr || num_tiles_ != required_tiles)) {
+            rs_debug_log(rank, "initialize_fused_ipc detected shape/pointer change, releasing old IPC resources");
             release_fused_ipc();
         }
 
@@ -402,9 +404,11 @@ class GemmAllReduce {
             return;
         }
 
-        int rank = ar_op.get_rank();
         local_c_ptr_ = c_ptr;
         num_tiles_ = required_tiles;
+
+        rs_debug_log(rank, "initialize_fused_ipc allocate buffers, num_tiles=" + std::to_string(num_tiles_) +
+                           ", world_size=" + std::to_string(world_size));
 
         signal_local_ = sycl::malloc_shared<int>(num_tiles_ * world_size, Q);
         ack_local_ = sycl::malloc_shared<int>(num_tiles_ * world_size, Q);
@@ -412,11 +416,16 @@ class GemmAllReduce {
         Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
         Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
 
+        rs_debug_log(rank, "initialize_fused_ipc local buffers ready");
+
         ipc_c_ptrs_ = exchange_ipc_ptrs(local_c_ptr_, rank, world_size, Q, opened_c_ptrs_);
         ipc_signal_ptrs_ = exchange_ipc_ptrs(signal_local_, rank, world_size, Q, opened_signal_ptrs_);
         ipc_ack_ptrs_ = exchange_ipc_ptrs(ack_local_, rank, world_size, Q, opened_ack_ptrs_);
 
+        rs_debug_log(rank, "initialize_fused_ipc remote IPC pointers ready");
+
         fused_ipc_initialized_ = true;
+        rs_debug_log(rank, "initialize_fused_ipc complete");
     }
 
     void release_fused_ipc() {
@@ -480,8 +489,12 @@ class GemmAllReduce {
         int num_n_tiles = int(ceil_div(n, tile_n));
         assert(fused_ipc_initialized_ && "fused IPC must be initialized in constructor");
 
+        rs_debug_log(rank, "run_fused start, zeroing signal/ack buffers");
+
         Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
         Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
+
+        rs_debug_log(rank, "run_fused launching fused kernel");
 
         // Launch fused GEMM + in-kernel ring reduce-scatter.
         gemm_cute_fused<decltype(mma)>(
@@ -489,7 +502,9 @@ class GemmAllReduce {
             ipc_c_ptrs_, ipc_signal_ptrs_, ipc_ack_ptrs_, send_local_,
             rank, world_size, m, n, num_n_tiles);
 
+        rs_debug_log(rank, "run_fused kernel submitted, waiting for completion");
         gemm_q.wait_and_throw();
+        rs_debug_log(rank, "run_fused complete");
     }
 
     // Separate path: GEMM then AllReduce as two independent steps

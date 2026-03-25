@@ -129,6 +129,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
         m, n, k, rank, world_size, A, B, C, Q, true);
 
     for (int i = 0; i < num_iters; i++) {
+      std::cout << "[debug] rank " << rank << " fused iter " << i << " begin\n";
       Q.wait();
       Q.fill(&*C.data(), TC(0), m * n).wait();
       MPI_Barrier(MPI_COMM_WORLD);
@@ -139,6 +140,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       auto stop = std::chrono::high_resolution_clock::now();
       const std::chrono::duration<double, std::milli> duration_ms = stop - start;
       fused_durations.push_back(duration_ms.count());
+      std::cout << "[debug] rank " << rank << " fused iter " << i << " end\n";
     }
   }
 
@@ -149,6 +151,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
         m, n, k, rank, world_size, A, B, C, Q, false);
 
     for (int i = 0; i < num_iters; i++) {
+      std::cout << "[debug] rank " << rank << " separate iter " << i << " begin\n";
       Q.wait();
       Q.fill(&*C.data(), TC(0), m * n).wait();
       MPI_Barrier(MPI_COMM_WORLD);
@@ -159,6 +162,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       auto stop = std::chrono::high_resolution_clock::now();
       const std::chrono::duration<double, std::milli> duration_ms = stop - start;
       separate_durations.push_back(duration_ms.count());
+      std::cout << "[debug] rank " << rank << " separate iter " << i << " end\n";
     }
   }
 
@@ -244,9 +248,30 @@ int main(int argc, char** argv) {
 
   using input_dtype = cute::bfloat16_t;
 
-  sycl::queue Q({sycl::property::queue::in_order()});
+  sycl::async_handler async_handler = [rank](sycl::exception_list exceptions) {
+    for (auto const& e : exceptions) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const sycl::exception& ex) {
+        std::cerr << "[rank " << rank << "] [async sycl exception] " << ex.what() << "\n";
+      }
+    }
+  };
 
-  test_case<input_dtype, input_dtype, float, 'R', 'R'>(Q, m, n, k, rank, world_size);
+  sycl::queue Q(sycl::gpu_selector_v, async_handler,
+                {sycl::property::queue::in_order()});
+
+  try {
+    std::cout << "[debug] rank " << rank << " entering test_case\n";
+    test_case<input_dtype, input_dtype, float, 'R', 'R'>(Q, m, n, k, rank, world_size);
+    std::cout << "[debug] rank " << rank << " test_case completed\n";
+  } catch (const sycl::exception& ex) {
+    std::cerr << "[rank " << rank << "] [sync sycl exception] " << ex.what() << "\n";
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  } catch (const std::exception& ex) {
+    std::cerr << "[rank " << rank << "] [std exception] " << ex.what() << "\n";
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
 
   MPI_Finalize();
   return 0;

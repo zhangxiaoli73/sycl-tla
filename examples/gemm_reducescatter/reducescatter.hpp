@@ -3,6 +3,8 @@
 #include <vector>
 #include <cassert>
 #include <iostream>
+#include <string>
+#include <cstdint>
 #include <mpi.h>
 #include <sycl/sycl.hpp>
 #include <cute/util/compat.hpp>
@@ -26,6 +28,10 @@
 #include "common/sycl_cute_common.hpp"
 
 using namespace cute;
+
+inline void rs_debug_log(int rank, const std::string& message) {
+    std::cerr << "[rank " << rank << "] [debug] " << message << std::endl;
+}
 
 // MPI datatype helper
 template <typename T> MPI_Datatype mpi_type();
@@ -66,6 +72,8 @@ T** exchange_ipc_ptrs(T* local_ptr, int rank, int world_size,
     auto ctx = Q.get_context();
     auto dev = Q.get_device();
 
+    rs_debug_log(rank, "exchange_ipc_ptrs begin, local_ptr=" + std::to_string(reinterpret_cast<uintptr_t>(local_ptr)));
+
     auto local_handle = ze_get_ipc_handle(ctx, local_ptr);
 
     std::vector<ze_ipc_mem_handle_t> all_handles(world_size);
@@ -73,16 +81,22 @@ T** exchange_ipc_ptrs(T* local_ptr, int rank, int world_size,
                   all_handles.data(), sizeof(ze_ipc_mem_handle_t), MPI_BYTE,
                   MPI_COMM_WORLD);
 
+    rs_debug_log(rank, "exchange_ipc_ptrs allgather done");
+
     T** ptrs = sycl::malloc_shared<T*>(world_size, Q);
     for (int i = 0; i < world_size; i++) {
         if (i == rank) {
             ptrs[i] = local_ptr;
+            rs_debug_log(rank, "ipc ptr self set for rank " + std::to_string(i));
         } else {
             void* remote = ze_open_ipc_handle(ctx, dev, all_handles[i]);
             ptrs[i] = static_cast<T*>(remote);
             opened_ptrs.push_back(remote);
+            rs_debug_log(rank, "ipc ptr opened for peer " + std::to_string(i) +
+                                   ", remote_ptr=" + std::to_string(reinterpret_cast<uintptr_t>(remote)));
         }
     }
+    rs_debug_log(rank, "exchange_ipc_ptrs end");
     return ptrs;
 }
 
