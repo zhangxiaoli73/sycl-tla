@@ -97,3 +97,8 @@ add_cutlass_mpi_executable(
   gemm_reducescatter_main.cpp
   )
 
+add_cutlass_mpi_executable(
+  ipc_buffer_check_main
+  ipc_buffer_check_main.cpp
+  )
+

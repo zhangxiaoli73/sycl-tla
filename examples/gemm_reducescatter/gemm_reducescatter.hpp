@@ -199,44 +199,44 @@ void gemm_device_fused(ATensor const& A,
                 dst_c[off] = dst_c[off] + send_local[off];
             }
 
-            sycl::group_barrier(item.get_group());
+            // sycl::group_barrier(item.get_group());
 
-            if (lid == 0) {
-                sycl::atomic_fence(sycl::memory_order::release,
-                                                     sycl::memory_scope::system);
-                ipc_signal_ptrs[dst][signal_base + rank] = step + 1;
-                sycl::atomic_fence(sycl::memory_order::release,
-                                                     sycl::memory_scope::system);
-            }
+            // if (lid == 0) {
+            //     sycl::atomic_fence(sycl::memory_order::release,
+            //                                          sycl::memory_scope::system);
+            //     ipc_signal_ptrs[dst][signal_base + rank] = step + 1;
+            //     sycl::atomic_fence(sycl::memory_order::release,
+            //                                          sycl::memory_scope::system);
+            // }
         }
 
-        if (rank == owner && lid == 0) {
-            int src = (rank - offset + world_size) % world_size;
-            while (true) {
-                sycl::atomic_fence(sycl::memory_order::acquire,
-                                                     sycl::memory_scope::system);
-                if (ipc_signal_ptrs[rank][signal_base + src] >= step + 1) {
-                    break;
-                }
-            }
+        // if (rank == owner && lid == 0) {
+        //     int src = (rank - offset + world_size) % world_size;
+        //     while (true) {
+        //         sycl::atomic_fence(sycl::memory_order::acquire,
+        //                                              sycl::memory_scope::system);
+        //         if (ipc_signal_ptrs[rank][signal_base + src] >= step + 1) {
+        //             break;
+        //         }
+        //     }
 
-            // Keep ack protocol available for sender progress control.
-            ipc_ack_ptrs[src][signal_base + rank] = step + 1;
-            sycl::atomic_fence(sycl::memory_order::release,
-                                                 sycl::memory_scope::system);
-        }
+        //     // Keep ack protocol available for sender progress control.
+        //     ipc_ack_ptrs[src][signal_base + rank] = step + 1;
+        //     sycl::atomic_fence(sycl::memory_order::release,
+        //                                          sycl::memory_scope::system);
+        // }
 
-        if (dst == owner && lid == 0) {
-            while (true) {
-                sycl::atomic_fence(sycl::memory_order::acquire,
-                                                     sycl::memory_scope::system);
-                if (ipc_ack_ptrs[rank][signal_base + dst] >= step + 1) {
-                    break;
-                }
-            }
-        }
+        // if (dst == owner && lid == 0) {
+        //     while (true) {
+        //         sycl::atomic_fence(sycl::memory_order::acquire,
+        //                                              sycl::memory_scope::system);
+        //         if (ipc_ack_ptrs[rank][signal_base + dst] >= step + 1) {
+        //             break;
+        //         }
+        //     }
+        // }
 
-        sycl::group_barrier(item.get_group());
+        // sycl::group_barrier(item.get_group());
     }
 }
 
@@ -410,9 +410,9 @@ class GemmAllReduce {
         rs_debug_log(rank, "initialize_fused_ipc allocate buffers, num_tiles=" + std::to_string(num_tiles_) +
                            ", world_size=" + std::to_string(world_size));
 
-        signal_local_ = sycl::malloc_shared<int>(num_tiles_ * world_size, Q);
-        ack_local_ = sycl::malloc_shared<int>(num_tiles_ * world_size, Q);
-        send_local_ = sycl::malloc_shared<TC>(static_cast<size_t>(m) * n, Q);
+        signal_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
+        ack_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
+        send_local_ = sycl::malloc_device<TC>(static_cast<size_t>(m) * n, Q);
         Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
         Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
 
