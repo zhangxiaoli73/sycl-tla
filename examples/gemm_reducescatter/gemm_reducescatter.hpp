@@ -134,8 +134,137 @@ void gemm_device(ATensor const& A, // (M,K)
   copy(copy_c, tCrC, tCgC);
 }
 
+template <class ATensor, class BTensor, class CTensor,
+                    class SendTensor, class TiledMMA>
+void gemm_device_v2(ATensor const& A, // (M,K)
+                                 BTensor const& B, // (N,K)
+                                 CTensor& C,       // (M,N)
+                                 SendTensor& Send, // (M,N)
+                                 TiledMMA const& mma) {
+    // -----
+    // Setup
+    // -----
+
+    /* Get workgroup and local IDs */
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+    auto wg_m = int(item.get_group(1));
+    auto wg_n = int(item.get_group(0));
+    auto local_id = int(item.get_local_id(0));
+
+    /* Create proxy coordinate tensors for each global tensor */
+    Tensor cA = make_identity_tensor(A.shape()); // (M,K)
+    Tensor cB = make_identity_tensor(B.shape()); // (N,K)
+    Tensor cC = make_identity_tensor(C.shape()); // (M,N)
+    Tensor cS = make_identity_tensor(Send.shape()); // (M,N)
+
+    /* Split GEMM into workgroup tiles, and identify our workgroup's tile
+     * (wg_coord) */
+    auto wg_tile = mma.tile_mnk();
+    auto wg_coord = make_coord(wg_m, wg_n, 0);
+
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile),
+                                                 make_coord(wg_m, _)); // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1, 2>(wg_tile),
+                                                 make_coord(wg_n, _)); // (BLK_N,BLK_K,k)
+    Tensor gC =
+            local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
+    Tensor gS =
+            local_tile(cS, wg_tile, wg_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
+
+    /* Create block 2D TiledCopies */
+    auto copy_a = make_block_2d_copy_A(mma, A);
+    auto copy_b = make_block_2d_copy_B(mma, B);
+    auto copy_c = make_block_2d_copy_D(mma, C);
+    auto copy_s = make_block_2d_copy_D(mma, Send);
+
+    /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
+    auto thr_mma = mma.get_slice(local_id);
+    auto thr_copy_a = copy_a.get_slice(local_id);
+    auto thr_copy_b = copy_b.get_slice(local_id);
+
+    /* Register fragments for MMA */
+    auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+    auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
+
+    /* Register fragments for copies */
+    auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+    auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
+
+    /* Partition global tensor (proxies) for copies */
+    Tensor tAgA = thr_copy_a.partition_S(gA);
+    Tensor tBgB = thr_copy_b.partition_S(gB);
+
+    /* Partition C and Send */
+    Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
+    Tensor tCgC =
+            thr_mma.partition_C(gC); /* also matches copy_c's source layout */
+    Tensor tSgS =
+            thr_mma.partition_C(gS); /* matches copy_s source layout expectations */
+
+    /* Create prefetch TiledCopy instances */
+    auto prefetch_a = make_block_2d_prefetch(copy_a);
+    auto prefetch_b = make_block_2d_prefetch(copy_b);
+
+    auto thr_prefetch_A = prefetch_a.get_slice(local_id);
+    auto thr_prefetch_B = prefetch_b.get_slice(local_id);
+
+    /* Partition global tensor (proxies) for prefetch */
+    auto pAgA = thr_prefetch_A.partition_S(gA);
+    auto pBgB = thr_prefetch_B.partition_S(gB);
+
+    /* Prefetch distance, in units of k tiles */
+    const int prefetch_dist = 3;
+
+    // ------
+    // Kernel
+    // ------
+
+    constexpr int barrier_scope = 2;
+
+    int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
+    int k_tile_prefetch = 0;
+
+    /* Clear the accumulators */
+    clear(tCrC);
+
+    /* Warm up loops with prefetch to L1 */
+    CUTE_UNROLL
+    for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
+        prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+    }
+
+    /* Main loop */
+    for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
+        /* Split barrier keeping threads loosely together */
+        // barrier_arrive(barrier_scope);
+
+        /* Copy A/B from global memory (ideally L1 cache) to registers */
+        copy(copy_a, tAgA(_, _, _, k_tile), tArA);
+        copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
+
+        /* Prefetch A/B tiles to L1 */
+        prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+        prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
+
+        /* Shuffle data from copy fragments to MMA fragments */
+        reorder(tArA, tCrA);
+        reorder(tBrB, tCrB);
+
+        /* Accumulate C += A * B */
+        gemm(mma, tCrA, tCrB, tCrC);
+
+        /* Other half of split barrier */
+        // barrier_wait(barrier_scope);
+    }
+
+    /* Write C and fused send buffer directly from accumulator fragment */
+    copy(copy_c, tCrC, tCgC);
+    copy(copy_s, tCrC, tSgS);
+}
+
 template <class ATensor, class BTensor, class CTensor, class TiledMMA>
-void gemm_device_fused(ATensor const& A,
+void gemm_device_fuse(ATensor const& A,
                                              BTensor const& B,
                                              CTensor& C,
                                              TiledMMA const& mma,
@@ -152,8 +281,10 @@ void gemm_device_fused(ATensor const& A,
 
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
 
+    auto send_tensor = make_tensor(make_gmem_ptr(send_local), C.layout());
+
     // Compute local GEMM tile first.
-    gemm_device(A, B, C, mma);
+    gemm_device_v2(A, B, C, send_tensor, mma);
 
     int wg_m = int(item.get_group(1));
     int wg_n = int(item.get_group(0));
@@ -171,16 +302,6 @@ void gemm_device_fused(ATensor const& A,
     int signal_base = tile_id * world_size;
 
     int owner = tile_id % world_size;
-    TC* local_c = C.data().get();
-
-    sycl::group_barrier(item.get_group());
-
-    for (int idx = lid; idx < tile_elems; idx += lsize) {
-        int r = idx / cols;
-        int c = idx % cols;
-        size_t off = size_t(row0 + r) * size_t(n) + size_t(col0 + c);
-        send_local[off] = local_c[off];
-    }
 
     sycl::group_barrier(item.get_group());
 
@@ -370,7 +491,7 @@ class GemmAllReduce {
             h.parallel_for<GemmCuteFusedName<TA, TB, LayoutKindA, LayoutKindB, 0>>(
                 sycl::nd_range<2>(global, local), kernel_props,
                 [=](sycl::nd_item<2>) {
-                    gemm_device_fused(A, B, C, mma,
+                    gemm_device_fuse(A, B, C, mma,
                                       ipc_c_ptrs, ipc_signal_ptrs, ipc_ack_ptrs,
                                       send_local, rank, world_size, m, n,
                                       num_n_tiles);
@@ -467,7 +588,7 @@ class GemmAllReduce {
         if (fusion_enabled_) {
             run_fused(A, B, C, Q);
         } else {
-            run_separate(A, B, C, Q);
+            run_gemm(A, B, C, Q);
         }
     }
 
@@ -508,7 +629,7 @@ class GemmAllReduce {
     }
 
     // Separate path: GEMM then AllReduce as two independent steps
-    void run_separate(
+    void run_gemm(
             TensorA_t const& A,
             TensorB_t const& B,
             TensorC_t& C,
@@ -519,12 +640,13 @@ class GemmAllReduce {
         gemm_q.wait_and_throw();
 
         // Step 2: AllReduce via MPI (no overlap with GEMM)
-        size_t num_elems = static_cast<size_t>(ar_op.get_m()) * ar_op.get_n();
-        ar_op.run(C.data().get(), num_elems, Q);
+        // todo: disable
+        // size_t num_elems = static_cast<size_t>(ar_op.get_m()) * ar_op.get_n();
+        // ar_op.run(C.data().get(), num_elems, Q);
     }
 
 private:
-    AllReduceOp<TA, LayoutKindA, TensorA_t, TC> ar_op;
+    ReduceScatterOp<TA, LayoutKindA, TensorA_t, TC> ar_op;
     sycl::queue gemm_q;
     bool fusion_enabled_ = true;
 

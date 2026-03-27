@@ -387,16 +387,16 @@ template <
     char LayoutKindA,
     typename TensorA_t,
     typename TC>
-class AllReduceOp {
+class ReduceScatterOp {
 
 public:
-    AllReduceOp(int m, int n, int k, int rank, int world_size, sycl::queue &Q)
+    ReduceScatterOp(int m, int n, int k, int rank, int world_size, sycl::queue &Q)
         : m(m), n(n), k(k), rank(rank), world_size(world_size), init_Q(Q) {
     }
 
-    ~AllReduceOp() = default;
+    ~ReduceScatterOp() = default;
 
-    // AllReduce the output C across all ranks using MPI.
+    // ReduceScatterOp currently reduces the output C across all ranks using MPI.
     //
     // After local GEMM, each rank has its partial C_local = A * B in device memory.
     // This method:

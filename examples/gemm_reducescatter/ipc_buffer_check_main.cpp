@@ -39,7 +39,21 @@ int main(int argc, char** argv) {
   };
 
   try {
-    sycl::queue q(sycl::gpu_selector_v, async_handler, {sycl::property::queue::in_order()});
+    // Explicitly select device based on rank
+    auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+    std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
+    for (size_t i = 0; i < devices.size(); ++i) {
+      std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+    }
+    if (devices.empty()) {
+      std::cerr << "[rank " << rank << "] No GPU devices found\n";
+      MPI_Finalize();
+      return 1;
+    }
+    auto device = devices[rank % devices.size()];
+    std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+
+    sycl::queue q(device, async_handler, {sycl::property::queue::in_order()});
 
     constexpr int kElems = 256;
     float* local_buf = sycl::malloc_device<float>(kElems, q);

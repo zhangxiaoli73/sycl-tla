@@ -157,7 +157,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       MPI_Barrier(MPI_COMM_WORLD);
 
       auto start = std::chrono::high_resolution_clock::now();
-      gemm_ar_sep.run_separate(A, B, C, Q);
+      gemm_ar_sep.run_gemm(A, B, C, Q);
       Q.wait();
       auto stop = std::chrono::high_resolution_clock::now();
       const std::chrono::duration<double, std::milli> duration_ms = stop - start;
@@ -225,19 +225,18 @@ int main(int argc, char** argv) {
 
   auto shift = [&] { return (argc-- > 0) ? *argv++ : nullptr; };
 
-  auto parse_size = [&] {
-    static constexpr int default_size = 1024;
+  auto parse_size = [&](int default_val) {
     if (auto e = shift())
       return atoi(e);
     else
-      return default_size;
+      return default_val;
   };
 
   (void) shift();
 
-  auto m = parse_size();
-  auto n = parse_size();
-  auto k = parse_size();
+  auto m = parse_size(8192);
+  auto n = parse_size(4096);
+  auto k = parse_size(1024);
 
   if (m < 256) {
     if (rank == 0)
@@ -258,7 +257,21 @@ int main(int argc, char** argv) {
     }
   };
 
-  sycl::queue Q(sycl::gpu_selector_v, async_handler,
+  // Explicitly select device based on rank
+  auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+  std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
+  for (size_t i = 0; i < devices.size(); ++i) {
+    std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+  }
+  if (devices.empty()) {
+    std::cerr << "No GPU devices found\n";
+    MPI_Finalize();
+    return 1;
+  }
+  auto device = devices[rank % devices.size()];
+  std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+
+  sycl::queue Q(device, async_handler,
                 {sycl::property::queue::in_order()});
 
   try {

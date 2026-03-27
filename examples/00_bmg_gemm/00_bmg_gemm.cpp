@@ -327,6 +327,21 @@ int main(int argc, const char** argv)
     return -1;
   }
 
+  // Explicitly select device based on rank (from gemm_reducescatter approach)
+  auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+  std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
+  for (size_t i = 0; i < devices.size(); ++i) {
+    std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+  }
+  if (devices.empty()) {
+    std::cerr << "No GPU devices found\n";
+    MPI_Finalize();
+    return 1;
+  }
+  auto device = devices[rank % devices.size()];
+  std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " 
+            << device.get_info<sycl::info::device::name>() << "\n";
+
   //
   // Run examples
   //
@@ -435,10 +450,9 @@ int main(int argc, const char** argv)
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   ExampleRunner<Gemm> runner;
-  // get remote data ptrs
-  // get symm buffers
-  auto tmp = SymmMemory(m, n, k, world_size, rank);
-  CUTLASS_CHECK(runner.run(options, hw_info, rank, world_size, remote_data_ptrs, remote_flag_ptrs));
+  // TODO: Integrate IPC support from gemm_reducescatter
+  // For now, run standard GEMM without IPC
+  CUTLASS_CHECK(runner.run(options, hw_info));
 
   MPI_Finalize();
   return 0;
