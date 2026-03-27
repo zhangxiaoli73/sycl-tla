@@ -135,12 +135,21 @@ void gemm_device(ATensor const& A, // (M,K)
 }
 
 template <class ATensor, class BTensor, class CTensor,
-                    class SendTensor, class TiledMMA>
-void gemm_device_v2(ATensor const& A, // (M,K)
-                                 BTensor const& B, // (N,K)
-                                 CTensor& C,       // (M,N)
-                                 SendTensor& Send, // (M,N)
-                                 TiledMMA const& mma) {
+          class DTensor, class TiledMMA>
+void gemm_device_v2(ATensor const& A,       // (M,K)
+                    BTensor const& B,       // (N,K)
+                    CTensor& C,             // (M,N) local GEMM buffer, IPC-accessible
+                    DTensor& D,             // (M,N/world_size) reduce-scatter output
+                    TiledMMA const& mma,
+                    typename CTensor::element_type** ipc_c_ptrs,  // remote C
+                    int** ipc_signal_ptrs,                        // remote flag
+                    int rank,
+                    int world_size,
+                    int m,
+                    int n,
+                    int num_n_tiles) {
+    (void)D;
+
     // -----
     // Setup
     // -----
@@ -155,7 +164,6 @@ void gemm_device_v2(ATensor const& A, // (M,K)
     Tensor cA = make_identity_tensor(A.shape()); // (M,K)
     Tensor cB = make_identity_tensor(B.shape()); // (N,K)
     Tensor cC = make_identity_tensor(C.shape()); // (M,N)
-    Tensor cS = make_identity_tensor(Send.shape()); // (M,N)
 
     /* Split GEMM into workgroup tiles, and identify our workgroup's tile
      * (wg_coord) */
@@ -168,14 +176,11 @@ void gemm_device_v2(ATensor const& A, // (M,K)
                                                  make_coord(wg_n, _)); // (BLK_N,BLK_K,k)
     Tensor gC =
             local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
-    Tensor gS =
-            local_tile(cS, wg_tile, wg_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
 
     /* Create block 2D TiledCopies */
     auto copy_a = make_block_2d_copy_A(mma, A);
     auto copy_b = make_block_2d_copy_B(mma, B);
     auto copy_c = make_block_2d_copy_D(mma, C);
-    auto copy_s = make_block_2d_copy_D(mma, Send);
 
     /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
     auto thr_mma = mma.get_slice(local_id);
@@ -194,12 +199,10 @@ void gemm_device_v2(ATensor const& A, // (M,K)
     Tensor tAgA = thr_copy_a.partition_S(gA);
     Tensor tBgB = thr_copy_b.partition_S(gB);
 
-    /* Partition C and Send */
+    /* Partition C and D */
     Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
     Tensor tCgC =
             thr_mma.partition_C(gC); /* also matches copy_c's source layout */
-    Tensor tSgS =
-            thr_mma.partition_C(gS); /* matches copy_s source layout expectations */
 
     /* Create prefetch TiledCopy instances */
     auto prefetch_a = make_block_2d_prefetch(copy_a);
@@ -258,106 +261,71 @@ void gemm_device_v2(ATensor const& A, // (M,K)
         barrier_wait(barrier_scope);
     }
 
-    /* Write C and fused send buffer directly from accumulator fragment */
+    /* Materialize the local GEMM tile before exposing it through IPC. */
     copy(copy_c, tCrC, tCgC);
-    copy(copy_s, tCrC, tSgS);
-}
+    item.barrier(sycl::access::fence_space::global_and_local);
 
-template <class ATensor, class BTensor, class CTensor, class TiledMMA>
-void gemm_device_fuse(ATensor const& A,
-                                             BTensor const& B,
-                                             CTensor& C,
-                                             TiledMMA const& mma,
-                                             typename CTensor::element_type** ipc_c_ptrs, //remote C
-                                             int** ipc_signal_ptrs, // remote flag
-                                             int** ipc_ack_ptrs, // remote ack flag
-                                             int rank,
-                                             int world_size,
-                                             int m,
-                                             int n,
-                                             int num_n_tiles) {
-    using TC = typename CTensor::element_type;
+    auto* local_c_ptr = C.data().get();
+    int tile_m = int(get<0>(wg_tile));
+    int tile_n = int(get<1>(wg_tile));
+    int tile_row_start = wg_m * tile_m;
+    int tile_col_start = wg_n * tile_n;
+    int tile_row_end = std::min(tile_row_start + tile_m, m) - 1;
+    int cols_in_tile = std::max(0, std::min(tile_n, n - tile_col_start));
 
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+    if (cols_in_tile > 0 && tile_row_start < m) {
+        int M_per_rank = m / world_size;
+        int rank_start = tile_row_start / M_per_rank;
+        int rank_end = tile_row_end / M_per_rank;
+        int tile_id = wg_m * num_n_tiles + wg_n;
+        int local_threads = int(item.get_local_range(0));
 
-    // Compute local GEMM tile first.
-    gemm_device(A, B, C, mma);
+        for (int cur_rank = rank_start; cur_rank <= rank_end; ++cur_rank) {
+            int m_start = std::max(M_per_rank * cur_rank, tile_row_start);
+            int m_end = std::min(M_per_rank * (cur_rank + 1) - 1, tile_row_end);
+            int overlap_rows = m_end - m_start + 1;
+            int src_row_offset = m_start - tile_row_start;
+            int dst_row_offset = rank * M_per_rank + (m_start % M_per_rank);
+            auto* remote_c_ptr = ipc_c_ptrs[cur_rank];
 
-    TC* symm_local_buffer = C.data().get();
+            bool full_tile_overlap =
+                (overlap_rows == tile_m) &&
+                (cols_in_tile == tile_n) &&
+                (src_row_offset == 0) &&
+                (dst_row_offset % tile_m == 0);
 
-    int wg_m = int(item.get_group(1));
-    int wg_n = int(item.get_group(0));
-    int lid = int(item.get_local_linear_id());
-    int lsize = int(item.get_local_range().size());
+            if (full_tile_overlap) {
+                // Fast path: use tiled copy when the tile is fully owned by one destination rank.
+                Tensor remoteC = make_tensor(make_gmem_ptr(remote_c_ptr), C.layout());
+                int remote_wg_m = dst_row_offset / tile_m;
+                auto remote_wg_coord = make_coord(remote_wg_m, wg_n, 0);
+                Tensor remote_gC =
+                    local_tile(remoteC, wg_tile, remote_wg_coord, Step<_1, _1, X>{});
+                Tensor remote_tCgC = thr_mma.partition_C(remote_gC);
+                copy(copy_c, tCrC, remote_tCgC);
+            } else {
+                // Boundary fallback for tiles that straddle rank partitions.
+                for (int linear_idx = local_id; linear_idx < overlap_rows * cols_in_tile; linear_idx += local_threads) {
+                    int row = linear_idx / cols_in_tile;
+                    int col = linear_idx % cols_in_tile;
+                    int global_col = tile_col_start + col;
+                    int src_row = src_row_offset + row;
+                    int dst_row = dst_row_offset + row;
 
-    int tile_m = int(get<0>(mma.tile_mnk()));
-    int tile_n = int(get<1>(mma.tile_mnk()));
-    int row0 = wg_m * tile_m;
-    int col0 = wg_n * tile_n;
-    int rows = sycl::min(tile_m, m - row0);
-    int cols = sycl::min(tile_n, n - col0);
-    int tile_elems = rows * cols;
-    int tile_id = wg_m * num_n_tiles + wg_n;
-    int signal_base = tile_id * world_size;
-
-    int owner = tile_id % world_size;
-
-    sycl::group_barrier(item.get_group());
-
-    // Ring-step reduce-scatter by tile owner.
-    // At each step, each rank sends only tiles owned by the current destination.
-    for (int step = 0; step < world_size - 1; ++step) {
-        int offset = step + 1;
-        int dst = (rank + offset) % world_size;
-
-        if (dst == owner) {
-            TC* dst_c = ipc_c_ptrs[dst];
-            for (int idx = lid; idx < tile_elems; idx += lsize) {
-                int r = idx / cols;
-                int c = idx % cols;
-                size_t off = size_t(row0 + r) * size_t(n) + size_t(col0 + c);
-                dst_c[off] = dst_c[off] + symm_local_buffer[off];
+                    remote_c_ptr[dst_row * n + global_col] = local_c_ptr[(tile_row_start + src_row) * n + global_col];
+                }
             }
 
-            // sycl::group_barrier(item.get_group());
+            item.barrier(sycl::access::fence_space::global_and_local);
 
-            // if (lid == 0) {
-            //     sycl::atomic_fence(sycl::memory_order::release,
-            //                                          sycl::memory_scope::system);
-            //     ipc_signal_ptrs[dst][signal_base + rank] = step + 1;
-            //     sycl::atomic_fence(sycl::memory_order::release,
-            //                                          sycl::memory_scope::system);
-            // }
+            if (local_id == 0) {
+                ipc_signal_ptrs[cur_rank][tile_id * world_size + rank] = 1;
+            }
+
+            item.barrier(sycl::access::fence_space::global_and_local);
         }
-
-        // if (rank == owner && lid == 0) {
-        //     int src = (rank - offset + world_size) % world_size;
-        //     while (true) {
-        //         sycl::atomic_fence(sycl::memory_order::acquire,
-        //                                              sycl::memory_scope::system);
-        //         if (ipc_signal_ptrs[rank][signal_base + src] >= step + 1) {
-        //             break;
-        //         }
-        //     }
-
-        //     // Keep ack protocol available for sender progress control.
-        //     ipc_ack_ptrs[src][signal_base + rank] = step + 1;
-        //     sycl::atomic_fence(sycl::memory_order::release,
-        //                                          sycl::memory_scope::system);
-        // }
-
-        // if (dst == owner && lid == 0) {
-        //     while (true) {
-        //         sycl::atomic_fence(sycl::memory_order::acquire,
-        //                                              sycl::memory_scope::system);
-        //         if (ipc_ack_ptrs[rank][signal_base + dst] >= step + 1) {
-        //             break;
-        //         }
-        //     }
-        // }
-
-        // sycl::group_barrier(item.get_group());
     }
+
 }
 
 template <typename TA, typename TB, typename TC>
@@ -419,10 +387,12 @@ class GemmAllReduce {
     using TensorA_t = Tensor<ViewEngine<gmem_ptr<TA*>>, Layout<tuple<int, int>, tuple<int, C<1>>>>;
     using TensorB_t = Tensor<ViewEngine<gmem_ptr<TB*>>, Layout<tuple<int, int>, tuple<C<1>, int>>>;
     using TensorC_t = Tensor<ViewEngine<gmem_ptr<TC*>>, Layout<tuple<int, int>, tuple<int, C<1>>>>;
+    // D: reduce-scatter output, shape (M, N/world_size), same element type as C.
+    using TensorD_t = Tensor<ViewEngine<gmem_ptr<TC*>>, Layout<tuple<int, int>, tuple<int, C<1>>>>;
 
     public:
     GemmAllReduce(int m, int n, int k, int rank, int world_size,
-                   TensorA_t const& A, TensorB_t const& B, TensorC_t& C,
+                   TensorA_t const& A, TensorB_t const& B, TensorC_t& C, TensorD_t& D,
                    sycl::queue& Q, bool fusion_enabled = true)
         : ar_op(m, n, k, rank, world_size, Q), gemm_q(Q), fusion_enabled_(fusion_enabled) {
         if (fusion_enabled_) {
@@ -467,10 +437,10 @@ class GemmAllReduce {
                 TensorA_t const& A,
                 TensorB_t const& B,
                 TensorC_t& C,
+                TensorD_t& D,
                 MMAType mma,
                 TC** ipc_c_ptrs,
                 int** ipc_signal_ptrs,
-                int** ipc_ack_ptrs,
                 int rank,
                 int world_size,
                 int m,
@@ -489,9 +459,9 @@ class GemmAllReduce {
             h.parallel_for<GemmCuteFusedName<TA, TB, LayoutKindA, LayoutKindB, 0>>(
                 sycl::nd_range<2>(global, local), kernel_props,
                 [=](sycl::nd_item<2>) {
-                    gemm_device_fuse(A, B, C, mma,
-                                      ipc_c_ptrs, ipc_signal_ptrs, ipc_ack_ptrs,
-                                      rank, world_size, m, n, num_n_tiles);
+                    gemm_device_v2(A, B, C, D, mma,
+                                   ipc_c_ptrs, ipc_signal_ptrs,
+                                   rank, world_size, m, n, num_n_tiles);
                 });
         });
     }
@@ -529,15 +499,13 @@ class GemmAllReduce {
                            ", world_size=" + std::to_string(world_size));
 
         signal_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
-        ack_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
+        // Signal buffer is initialized once here and then reused.
         Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
-        Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
 
         rs_debug_log(rank, "initialize_fused_ipc local buffers ready");
 
         ipc_c_ptrs_ = exchange_ipc_ptrs(local_c_ptr_, rank, world_size, Q, opened_c_ptrs_);
         ipc_signal_ptrs_ = exchange_ipc_ptrs(signal_local_, rank, world_size, Q, opened_signal_ptrs_);
-        ipc_ack_ptrs_ = exchange_ipc_ptrs(ack_local_, rank, world_size, Q, opened_ack_ptrs_);
 
         rs_debug_log(rank, "initialize_fused_ipc remote IPC pointers ready");
 
@@ -552,19 +520,14 @@ class GemmAllReduce {
 
         close_ipc_ptrs(gemm_q, opened_c_ptrs_);
         close_ipc_ptrs(gemm_q, opened_signal_ptrs_);
-        close_ipc_ptrs(gemm_q, opened_ack_ptrs_);
 
         if (ipc_c_ptrs_) sycl::free(ipc_c_ptrs_, gemm_q);
         if (ipc_signal_ptrs_) sycl::free(ipc_signal_ptrs_, gemm_q);
-        if (ipc_ack_ptrs_) sycl::free(ipc_ack_ptrs_, gemm_q);
         if (signal_local_) sycl::free(signal_local_, gemm_q);
-        if (ack_local_) sycl::free(ack_local_, gemm_q);
 
         ipc_c_ptrs_ = nullptr;
         ipc_signal_ptrs_ = nullptr;
-        ipc_ack_ptrs_ = nullptr;
         signal_local_ = nullptr;
-        ack_local_ = nullptr;
         local_c_ptr_ = nullptr;
         num_tiles_ = 0;
         fused_ipc_initialized_ = false;
@@ -578,9 +541,10 @@ class GemmAllReduce {
             TensorA_t const& A,
             TensorB_t const& B,
             TensorC_t& C,
+            TensorD_t& D,
             sycl::queue& Q) {
         if (fusion_enabled_) {
-            run_fused(A, B, C, Q);
+            run_fused(A, B, C, D, Q);
         } else {
             run_gemm(A, B, C, Q);
         }
@@ -588,10 +552,13 @@ class GemmAllReduce {
 
     // Fused path: tile-level GEMM + reduce-scatter in one kernel.
     // Tile ownership is assigned by tile_id % world_size.
+    // C (m×n): local GEMM buffer exposed via IPC.
+    // D (m×n/world_size): reduce-scatter output for this rank.
     void run_fused(
             TensorA_t const& A,
             TensorB_t const& B,
             TensorC_t& C,
+            TensorD_t& D,
             sycl::queue& Q) {
         auto mma = choose_tiled_mma(A, B, C);
 
@@ -604,17 +571,12 @@ class GemmAllReduce {
         int num_n_tiles = int(ceil_div(n, tile_n));
         assert(fused_ipc_initialized_ && "fused IPC must be initialized in constructor");
 
-        rs_debug_log(rank, "run_fused start, zeroing signal/ack buffers");
-
-        Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
-        Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
-
         rs_debug_log(rank, "run_fused launching fused kernel");
 
         // Launch fused GEMM + in-kernel ring reduce-scatter.
         gemm_cute_fused<decltype(mma)>(
-            gemm_q, A, B, C, mma,
-            ipc_c_ptrs_, ipc_signal_ptrs_, ipc_ack_ptrs_, rank, world_size,
+            gemm_q, A, B, C, D, mma,
+            ipc_c_ptrs_, ipc_signal_ptrs_, rank, world_size,
             m, n, num_n_tiles);
 
         rs_debug_log(rank, "run_fused kernel submitted, waiting for completion");
@@ -649,11 +611,8 @@ private:
     int num_tiles_ = 0;
     TC* local_c_ptr_ = nullptr;
     int* signal_local_ = nullptr;
-    int* ack_local_ = nullptr;
     TC** ipc_c_ptrs_ = nullptr;
     int** ipc_signal_ptrs_ = nullptr;
-    int** ipc_ack_ptrs_ = nullptr;
     std::vector<void*> opened_c_ptrs_;
     std::vector<void*> opened_signal_ptrs_;
-    std::vector<void*> opened_ack_ptrs_;
 };

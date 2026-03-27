@@ -96,6 +96,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   auto A = make_shared_usm_tensor<TA, LayoutA>(Q, m, k);
   auto B = make_shared_usm_tensor<TB, tlayoutB>(Q, n, k);
   auto C = make_shared_usm_tensor<TC, 'R'>(Q, m, n);
+  auto D = make_shared_usm_tensor<TC, 'R'>(Q, m, n / world_size); // reduce-scatter output
 
   if (rs_log_enabled()) {
     std::cout << "node: " << rank << ", usm allocated for A, B, C\n";
@@ -105,9 +106,10 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   cutlass::initialize_block(&*A.data(), m * k, seed + 2023);
   cutlass::initialize_block(&*B.data(), n * k, seed + 2022);
   Q.fill(&*C.data(), TC(0), m * n).wait();
+  Q.fill(&*D.data(), TC(0), m * (n / world_size)).wait();
 
   if (rs_log_enabled()) {
-    std::cout << "node: " << rank << ", usm filled for A, B, C\n";
+    std::cout << "node: " << rank << ", usm filled for A, B, C, D\n";
   }
 
 #ifndef SKIP_VERIFY
@@ -130,7 +132,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   {
     // Force fusion enabled
     GemmAllReduce<TA, TB, TC, LayoutA, tlayoutB> gemm_ar_fused(
-        m, n, k, rank, world_size, A, B, C, Q, true);
+        m, n, k, rank, world_size, A, B, C, D, Q, true);
 
     for (int i = 0; i < num_iters; i++) {
       if (rs_log_enabled()) {
@@ -138,10 +140,11 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       }
       Q.wait();
       Q.fill(&*C.data(), TC(0), m * n).wait();
+      Q.fill(&*D.data(), TC(0), m * (n / world_size)).wait();
       MPI_Barrier(MPI_COMM_WORLD);
 
       auto start = std::chrono::high_resolution_clock::now();
-      gemm_ar_fused.run_fused(A, B, C, Q);
+      gemm_ar_fused.run_fused(A, B, C, D, Q);
       Q.wait();
       auto stop = std::chrono::high_resolution_clock::now();
       if (i >= warmup_iters) {
@@ -158,7 +161,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   std::vector<double> separate_durations;
   {
     GemmAllReduce<TA, TB, TC, LayoutA, tlayoutB> gemm_ar_sep(
-        m, n, k, rank, world_size, A, B, C, Q, false);
+        m, n, k, rank, world_size, A, B, C, D, Q, false);
 
     for (int i = 0; i < num_iters; i++) {
       if (rs_log_enabled()) {
@@ -220,6 +223,7 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   sycl::free(A.data().get(), Q);
   sycl::free(B.data().get(), Q);
   sycl::free(C.data().get(), Q);
+  sycl::free(D.data().get(), Q);
 
 #ifndef SKIP_VERIFY
   sycl::free(A_ref.data().get(), Q);
