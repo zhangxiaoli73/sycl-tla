@@ -109,7 +109,7 @@ void gemm_device(ATensor const& A, // (M,K)
   /* Main loop */
   for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
     /* Split barrier keeping threads loosely together */
-    // barrier_arrive(barrier_scope);
+    barrier_arrive(barrier_scope);
 
     /* Copy A/B from global memory (ideally L1 cache) to registers */
     copy(copy_a, tAgA(_, _, _, k_tile), tArA);
@@ -127,7 +127,7 @@ void gemm_device(ATensor const& A, // (M,K)
     gemm(mma, tCrA, tCrB, tCrC);
 
     /* Other half of split barrier */
-    // barrier_wait(barrier_scope);
+    barrier_wait(barrier_scope);
   }
 
   /* Write C to global memory */
@@ -237,7 +237,7 @@ void gemm_device_v2(ATensor const& A, // (M,K)
     /* Main loop */
     for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
         /* Split barrier keeping threads loosely together */
-        // barrier_arrive(barrier_scope);
+        barrier_arrive(barrier_scope);
 
         /* Copy A/B from global memory (ideally L1 cache) to registers */
         copy(copy_a, tAgA(_, _, _, k_tile), tArA);
@@ -255,7 +255,7 @@ void gemm_device_v2(ATensor const& A, // (M,K)
         gemm(mma, tCrA, tCrB, tCrC);
 
         /* Other half of split barrier */
-        // barrier_wait(barrier_scope);
+        barrier_wait(barrier_scope);
     }
 
     /* Write C and fused send buffer directly from accumulator fragment */

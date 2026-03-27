@@ -41,9 +41,11 @@ int main(int argc, char** argv) {
   try {
     // Explicitly select device based on rank
     auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-    std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
-    for (size_t i = 0; i < devices.size(); ++i) {
-      std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+    if (rs_log_enabled()) {
+      std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
+      for (size_t i = 0; i < devices.size(); ++i) {
+        std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+      }
     }
     if (devices.empty()) {
       std::cerr << "[rank " << rank << "] No GPU devices found\n";
@@ -51,7 +53,9 @@ int main(int argc, char** argv) {
       return 1;
     }
     auto device = devices[rank % devices.size()];
-    std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+    if (rs_log_enabled()) {
+      std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+    }
 
     sycl::queue q(device, async_handler, {sycl::property::queue::in_order()});
 
@@ -81,8 +85,10 @@ int main(int argc, char** argv) {
       }).wait();
     }
 
-    std::cout << "[rank " << rank << "] [ipc-check] local_buf=" << static_cast<void*>(local_buf)
-              << " initialized with base=" << (rank * 1000.0f) << "\n";
+    if (rs_log_enabled()) {
+      std::cout << "[rank " << rank << "] [ipc-check] local_buf=" << static_cast<void*>(local_buf)
+                << " initialized with base=" << (rank * 1000.0f) << "\n";
+    }
 
     // Step 2: Barrier — ensure all ranks have written their own buffers before IPC exchange.
     MPI_Barrier(MPI_COMM_WORLD);
@@ -152,19 +158,21 @@ int main(int argc, char** argv) {
     bool flag_ok = (read_flag[0] == src + 1);
     bool ok = buf_ok && flag_ok;
 
-    std::cout << "[rank " << rank << "] [ipc-check] IPC read from src=" << src
-              << ": buf[0]=" << read_buf[0] << "(exp " << (src_base + check_indices[0]) << ")"
-              << " buf[1]=" << read_buf[1] << "(exp " << (src_base + check_indices[1]) << ")"
-              << " buf[" << check_indices[2] << "]=" << read_buf[2]
-              << "(exp " << (src_base + check_indices[2]) << ")"
-              << " buf[" << check_indices[3] << "]=" << read_buf[3]
-              << "(exp " << (src_base + check_indices[3]) << ")"
-              << " flag=" << read_flag[0] << "(exp " << (src + 1) << ")";
-    if (!buf_ok) {
-      std::cout << " FIRST_MISMATCH idx=" << first_bad_check
-                << " got=" << first_bad_got << " exp=" << first_bad_expected;
+    if (rs_log_enabled()) {
+      std::cout << "[rank " << rank << "] [ipc-check] IPC read from src=" << src
+                << ": buf[0]=" << read_buf[0] << "(exp " << (src_base + check_indices[0]) << ")"
+                << " buf[1]=" << read_buf[1] << "(exp " << (src_base + check_indices[1]) << ")"
+                << " buf[" << check_indices[2] << "]=" << read_buf[2]
+                << "(exp " << (src_base + check_indices[2]) << ")"
+                << " buf[" << check_indices[3] << "]=" << read_buf[3]
+                << "(exp " << (src_base + check_indices[3]) << ")"
+                << " flag=" << read_flag[0] << "(exp " << (src + 1) << ")";
+      if (!buf_ok) {
+        std::cout << " FIRST_MISMATCH idx=" << first_bad_check
+                  << " got=" << first_bad_got << " exp=" << first_bad_expected;
+      }
+      std::cout << " status=" << (ok ? "PASS" : "FAIL") << "\n";
     }
-    std::cout << " status=" << (ok ? "PASS" : "FAIL") << "\n";
 
     int ok_int = ok ? 1 : 0;
     int all_ok = 0;

@@ -85,7 +85,7 @@ template <typename TA, typename TB, typename TC, char LayoutA = 'R',
           char LayoutB = 'R'>
 void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
 
-  if (rank == 0)
+  if (rank == 0 && rs_log_enabled())
     std::cout << type_str<TA>() << " (" << LayoutA << ") x " << type_str<TB>()
               << " (" << LayoutB << ") -> " << type_str<TC>() << ": \n";
 
@@ -97,14 +97,18 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
   auto B = make_shared_usm_tensor<TB, tlayoutB>(Q, n, k);
   auto C = make_shared_usm_tensor<TC, 'R'>(Q, m, n);
 
-  std::cout << "node: " << rank << ", usm allocated for A, B, C\n";
+  if (rs_log_enabled()) {
+    std::cout << "node: " << rank << ", usm allocated for A, B, C\n";
+  }
 
   uint64_t seed = 11;
   cutlass::initialize_block(&*A.data(), m * k, seed + 2023);
   cutlass::initialize_block(&*B.data(), n * k, seed + 2022);
   Q.fill(&*C.data(), TC(0), m * n).wait();
 
-  std::cout << "node: " << rank << ", usm filled for A, B, C\n";
+  if (rs_log_enabled()) {
+    std::cout << "node: " << rank << ", usm filled for A, B, C\n";
+  }
 
 #ifndef SKIP_VERIFY
   auto A_ref = make_shared_usm_tensor<float, LayoutA>(Q, m, k);
@@ -129,7 +133,9 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
         m, n, k, rank, world_size, A, B, C, Q, true);
 
     for (int i = 0; i < num_iters; i++) {
-      std::cout << "[debug] rank " << rank << " fused iter " << i << " begin\n";
+      if (rs_log_enabled()) {
+        std::cout << "[debug] rank " << rank << " fused iter " << i << " begin\n";
+      }
       Q.wait();
       Q.fill(&*C.data(), TC(0), m * n).wait();
       MPI_Barrier(MPI_COMM_WORLD);
@@ -140,7 +146,9 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       auto stop = std::chrono::high_resolution_clock::now();
       const std::chrono::duration<double, std::milli> duration_ms = stop - start;
       fused_durations.push_back(duration_ms.count());
-      std::cout << "[debug] rank " << rank << " fused iter " << i << " end\n";
+      if (rs_log_enabled()) {
+        std::cout << "[debug] rank " << rank << " fused iter " << i << " end\n";
+      }
     }
   }
 
@@ -151,7 +159,9 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
         m, n, k, rank, world_size, A, B, C, Q, false);
 
     for (int i = 0; i < num_iters; i++) {
-      std::cout << "[debug] rank " << rank << " separate iter " << i << " begin\n";
+      if (rs_log_enabled()) {
+        std::cout << "[debug] rank " << rank << " separate iter " << i << " begin\n";
+      }
       Q.wait();
       Q.fill(&*C.data(), TC(0), m * n).wait();
       MPI_Barrier(MPI_COMM_WORLD);
@@ -162,7 +172,9 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       auto stop = std::chrono::high_resolution_clock::now();
       const std::chrono::duration<double, std::milli> duration_ms = stop - start;
       separate_durations.push_back(duration_ms.count());
-      std::cout << "[debug] rank " << rank << " separate iter " << i << " end\n";
+      if (rs_log_enabled()) {
+        std::cout << "[debug] rank " << rank << " separate iter " << i << " end\n";
+      }
     }
   }
 
@@ -221,7 +233,9 @@ int main(int argc, char** argv) {
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-  std::cout << "MPI initialized, rank " << rank << " / " << world_size << "\n";
+  if (rs_log_enabled()) {
+    std::cout << "MPI initialized, rank " << rank << " / " << world_size << "\n";
+  }
 
   auto shift = [&] { return (argc-- > 0) ? *argv++ : nullptr; };
 
@@ -259,9 +273,11 @@ int main(int argc, char** argv) {
 
   // Explicitly select device based on rank
   auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-  std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
-  for (size_t i = 0; i < devices.size(); ++i) {
-    std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+  if (rs_log_enabled()) {
+    std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
+    for (size_t i = 0; i < devices.size(); ++i) {
+      std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
+    }
   }
   if (devices.empty()) {
     std::cerr << "No GPU devices found\n";
@@ -269,15 +285,21 @@ int main(int argc, char** argv) {
     return 1;
   }
   auto device = devices[rank % devices.size()];
-  std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+  if (rs_log_enabled()) {
+    std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " << device.get_info<sycl::info::device::name>() << "\n";
+  }
 
   sycl::queue Q(device, async_handler,
                 {sycl::property::queue::in_order()});
 
   try {
-    std::cout << "[debug] rank " << rank << " entering test_case\n";
+    if (rs_log_enabled()) {
+      std::cout << "[debug] rank " << rank << " entering test_case\n";
+    }
     test_case<input_dtype, input_dtype, float, 'R', 'R'>(Q, m, n, k, rank, world_size);
-    std::cout << "[debug] rank " << rank << " test_case completed\n";
+    if (rs_log_enabled()) {
+      std::cout << "[debug] rank " << rank << " test_case completed\n";
+    }
   } catch (const sycl::exception& ex) {
     std::cerr << "[rank " << rank << "] [sync sycl exception] " << ex.what() << "\n";
     MPI_Abort(MPI_COMM_WORLD, 1);

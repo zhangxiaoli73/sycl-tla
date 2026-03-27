@@ -5,6 +5,8 @@
 #include <iostream>
 #include <string>
 #include <cstdint>
+#include <cctype>
+#include <cstdlib>
 #include <ctime>
 #include <cerrno>
 #include <cstdio>
@@ -41,8 +43,33 @@
 
 using namespace cute;
 
+inline bool rs_log_enabled() {
+    static bool enabled = [] {
+        const char* env = std::getenv("GEMM_REDUCESCATTER_LOG");
+        if (env == nullptr || env[0] == '\0') {
+            return false;
+        }
+
+        std::string value(env);
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+
+        return !(value == "0" || value == "false" || value == "off" || value == "no");
+    }();
+    return enabled;
+}
+
+inline void rs_info_log(const std::string& message) {
+    if (rs_log_enabled()) {
+        std::cout << message << std::endl;
+    }
+}
+
 inline void rs_debug_log(int rank, const std::string& message) {
-    std::cerr << "[rank " << rank << "] [debug] " << message << std::endl;
+    if (rs_log_enabled()) {
+        std::cerr << "[rank " << rank << "] [debug] " << message << std::endl;
+    }
 }
 
 #if defined(__linux__)

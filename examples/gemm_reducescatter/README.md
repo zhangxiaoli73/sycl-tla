@@ -25,3 +25,11 @@ ninja test_examples_gemm_reducescatter_main
 ```bash
 I_MPI_FABRICS=ofi FI_PROVIDER=shm mpiexec -np 1 -env ZE_AFFINITY_MASK 0 ./build/examples/gemm_reducescatter/gemm_reducescatter_main 2048 2048 2048 : -np 1 -env ZE_AFFINITY_MASK 1 ./build/examples/gemm_reducescatter/gemm_reducescatter_main 2048 2048 2048
 ```
+
+### Logging
+- Logging is disabled by default in this folder.
+- Enable verbose logs by setting `GEMM_REDUCESCATTER_LOG` to a truthy value, for example:
+```bash
+export GEMM_REDUCESCATTER_LOG=1
+```
+- Falsy values such as `0`, `false`, `off`, and `no` keep logging disabled.
