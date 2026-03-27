@@ -271,7 +271,6 @@ void gemm_device_fuse(ATensor const& A,
                                              typename CTensor::element_type** ipc_c_ptrs, //remote C
                                              int** ipc_signal_ptrs, // remote flag
                                              int** ipc_ack_ptrs, // remote ack flag
-                                             typename CTensor::element_type* send_local,
                                              int rank,
                                              int world_size,
                                              int m,
@@ -281,10 +280,10 @@ void gemm_device_fuse(ATensor const& A,
 
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
 
-    auto send_tensor = make_tensor(make_gmem_ptr(send_local), C.layout());
-
     // Compute local GEMM tile first.
-    gemm_device_v2(A, B, C, send_tensor, mma);
+    gemm_device(A, B, C, mma);
+
+    TC* symm_local_buffer = C.data().get();
 
     int wg_m = int(item.get_group(1));
     int wg_n = int(item.get_group(0));
@@ -317,7 +316,7 @@ void gemm_device_fuse(ATensor const& A,
                 int r = idx / cols;
                 int c = idx % cols;
                 size_t off = size_t(row0 + r) * size_t(n) + size_t(col0 + c);
-                dst_c[off] = dst_c[off] + send_local[off];
+                dst_c[off] = dst_c[off] + symm_local_buffer[off];
             }
 
             // sycl::group_barrier(item.get_group());
@@ -472,7 +471,6 @@ class GemmAllReduce {
                 TC** ipc_c_ptrs,
                 int** ipc_signal_ptrs,
                 int** ipc_ack_ptrs,
-                TC* send_local,
                 int rank,
                 int world_size,
                 int m,
@@ -493,8 +491,7 @@ class GemmAllReduce {
                 [=](sycl::nd_item<2>) {
                     gemm_device_fuse(A, B, C, mma,
                                       ipc_c_ptrs, ipc_signal_ptrs, ipc_ack_ptrs,
-                                      send_local, rank, world_size, m, n,
-                                      num_n_tiles);
+                                      rank, world_size, m, n, num_n_tiles);
                 });
         });
     }
@@ -533,7 +530,6 @@ class GemmAllReduce {
 
         signal_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
         ack_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, Q);
-        send_local_ = sycl::malloc_device<TC>(static_cast<size_t>(m) * n, Q);
         Q.memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
         Q.memset(ack_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
 
@@ -563,14 +559,12 @@ class GemmAllReduce {
         if (ipc_ack_ptrs_) sycl::free(ipc_ack_ptrs_, gemm_q);
         if (signal_local_) sycl::free(signal_local_, gemm_q);
         if (ack_local_) sycl::free(ack_local_, gemm_q);
-        if (send_local_) sycl::free(send_local_, gemm_q);
 
         ipc_c_ptrs_ = nullptr;
         ipc_signal_ptrs_ = nullptr;
         ipc_ack_ptrs_ = nullptr;
         signal_local_ = nullptr;
         ack_local_ = nullptr;
-        send_local_ = nullptr;
         local_c_ptr_ = nullptr;
         num_tiles_ = 0;
         fused_ipc_initialized_ = false;
@@ -620,8 +614,8 @@ class GemmAllReduce {
         // Launch fused GEMM + in-kernel ring reduce-scatter.
         gemm_cute_fused<decltype(mma)>(
             gemm_q, A, B, C, mma,
-            ipc_c_ptrs_, ipc_signal_ptrs_, ipc_ack_ptrs_, send_local_,
-            rank, world_size, m, n, num_n_tiles);
+            ipc_c_ptrs_, ipc_signal_ptrs_, ipc_ack_ptrs_, rank, world_size,
+            m, n, num_n_tiles);
 
         rs_debug_log(rank, "run_fused kernel submitted, waiting for completion");
         gemm_q.wait_and_throw();
@@ -656,7 +650,6 @@ private:
     TC* local_c_ptr_ = nullptr;
     int* signal_local_ = nullptr;
     int* ack_local_ = nullptr;
-    TC* send_local_ = nullptr;
     TC** ipc_c_ptrs_ = nullptr;
     int** ipc_signal_ptrs_ = nullptr;
     int** ipc_ack_ptrs_ = nullptr;

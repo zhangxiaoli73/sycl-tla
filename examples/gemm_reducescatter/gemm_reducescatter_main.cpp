@@ -144,8 +144,10 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       gemm_ar_fused.run_fused(A, B, C, Q);
       Q.wait();
       auto stop = std::chrono::high_resolution_clock::now();
-      const std::chrono::duration<double, std::milli> duration_ms = stop - start;
-      fused_durations.push_back(duration_ms.count());
+      if (i >= warmup_iters) {
+        const std::chrono::duration<double, std::milli> duration_ms = stop - start;
+        fused_durations.push_back(duration_ms.count());
+      }
       if (rs_log_enabled()) {
         std::cout << "[debug] rank " << rank << " fused iter " << i << " end\n";
       }
@@ -170,8 +172,10 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
       gemm_ar_sep.run_gemm(A, B, C, Q);
       Q.wait();
       auto stop = std::chrono::high_resolution_clock::now();
-      const std::chrono::duration<double, std::milli> duration_ms = stop - start;
-      separate_durations.push_back(duration_ms.count());
+      if (i >= warmup_iters) {
+        const std::chrono::duration<double, std::milli> duration_ms = stop - start;
+        separate_durations.push_back(duration_ms.count());
+      }
       if (rs_log_enabled()) {
         std::cout << "[debug] rank " << rank << " separate iter " << i << " end\n";
       }
@@ -180,11 +184,10 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
 
   // --- Print comparison ---
   if (rank == 0) {
-    // Compute averages excluding warmup
     auto avg = [&](const std::vector<double>& v) {
       double sum = 0;
-      for (int i = warmup_iters; i < num_iters; i++) sum += v[i];
-      return sum / (num_iters - warmup_iters);
+      for (double duration : v) sum += duration;
+      return sum / v.size();
     };
 
     double fused_avg = avg(fused_durations);
@@ -193,9 +196,9 @@ void test_case(sycl::queue& Q, int m, int n, int k, int rank, int world_size) {
 
     std::cout << "\n=== GEMM + AllReduce Benchmark (M=" << m << ", N=" << n << ", K=" << k
               << ", ranks=" << world_size << ") ===\n";
-    std::cout << "Fused timings (ms):    ";
+    std::cout << "Fused timings (ms, warmup excluded):    ";
     for (auto d : fused_durations) std::cout << d << " ";
-    std::cout << "\nSeparate timings (ms): ";
+    std::cout << "\nSeparate timings (ms, warmup excluded): ";
     for (auto d : separate_durations) std::cout << d << " ";
     std::cout << "\n\nFused avg    (excl warmup): " << fused_avg << " ms\n";
     std::cout << "Separate avg (excl warmup): " << separate_avg << " ms\n";
