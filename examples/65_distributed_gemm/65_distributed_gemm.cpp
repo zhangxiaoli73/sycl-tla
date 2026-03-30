@@ -260,7 +260,7 @@ struct Options {
   float alpha = 1.f, beta = 0.f;
   int iterations = 100;
   int warmup_iterations = 10;
-  int m = 16384, n = 106496, k = 16384, l = 1;
+  int m = 1024, n = 1024, k = 1024, l = 1;
   float eps = 0.f;
 
   // Parses the command line
@@ -613,8 +613,19 @@ int run(Options &options) {
       throw std::runtime_error("Not enough GPU devices available");
     }
     std::cout << "[LOG] Found " << devices.size() << " GPU devices on system" << std::endl;
-    stream_arr[device_idx] = new sycl::queue(devices[device_idx]);
-    std::cout << "[LOG] Queue created for device " << device_idx << std::endl;
+    std::cout << "[LOG] Creating queue for device " << device_idx << std::endl;
+    std::cout << "[LOG] Device " << device_idx << " name: " << devices[device_idx].get_info<sycl::info::device::name>() << std::endl;
+    
+    try {
+      stream_arr[device_idx] = new sycl::queue(devices[device_idx]);
+      std::cout << "[LOG] Queue created for device " << device_idx << std::endl;
+    } catch (const sycl::exception& e) {
+      std::cerr << "[LOG] Failed to create queue for device " << device_idx << ": " << e.what() << std::endl;
+      throw;
+    } catch (const std::exception& e) {
+      std::cerr << "[LOG] Unexpected error creating queue for device " << device_idx << ": " << e.what() << std::endl;
+      throw;
+    }
   }
   std::cout << "[LOG] All SYCL queues created" << std::endl;
 

@@ -148,183 +148,116 @@ void gemm_device_v2(ATensor const& A,       // (M,K)
                     int m,
                     int n,
                     int num_n_tiles) {
-    (void)D;
-
     // -----
     // Setup
     // -----
 
-    /* Get workgroup and local IDs */
     auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
     auto wg_m = int(item.get_group(1));
     auto wg_n = int(item.get_group(0));
     auto local_id = int(item.get_local_id(0));
 
-    /* Create proxy coordinate tensors for each global tensor */
     Tensor cA = make_identity_tensor(A.shape()); // (M,K)
     Tensor cB = make_identity_tensor(B.shape()); // (N,K)
     Tensor cC = make_identity_tensor(C.shape()); // (M,N)
 
-    /* Split GEMM into workgroup tiles, and identify our workgroup's tile
-     * (wg_coord) */
     auto wg_tile = mma.tile_mnk();
     auto wg_coord = make_coord(wg_m, wg_n, 0);
 
-    Tensor gA = local_tile(cA, select<0, 2>(wg_tile),
-                                                 make_coord(wg_m, _)); // (BLK_M,BLK_K,k)
-    Tensor gB = local_tile(cB, select<1, 2>(wg_tile),
-                                                 make_coord(wg_n, _)); // (BLK_N,BLK_K,k)
-    Tensor gC =
-            local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _)); // (BLK_M,BLK_K,k)
+    Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _)); // (BLK_N,BLK_K,k)
+    Tensor gC = local_tile(cC, wg_tile, wg_coord, Step<_1, _1, X>{});       // (BLK_M,BLK_N)
 
-    /* Create block 2D TiledCopies */
     auto copy_a = make_block_2d_copy_A(mma, A);
     auto copy_b = make_block_2d_copy_B(mma, B);
     auto copy_c = make_block_2d_copy_D(mma, C);
 
-    /* Slice TiledCopy/TiledMMA operations to thread (work-item) level */
     auto thr_mma = mma.get_slice(local_id);
     auto thr_copy_a = copy_a.get_slice(local_id);
     auto thr_copy_b = copy_b.get_slice(local_id);
 
-    /* Register fragments for MMA */
     auto tCrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
     auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
 
-    /* Register fragments for copies */
     auto tArA = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
     auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
 
-    /* Partition global tensor (proxies) for copies */
     Tensor tAgA = thr_copy_a.partition_S(gA);
     Tensor tBgB = thr_copy_b.partition_S(gB);
 
-    /* Partition C and D */
     Tensor tCrC = partition_fragment_C(mma, select<0, 1>(wg_tile));
-    Tensor tCgC =
-            thr_mma.partition_C(gC); /* also matches copy_c's source layout */
+    Tensor tCgC = thr_mma.partition_C(gC);
 
-    /* Create prefetch TiledCopy instances */
     auto prefetch_a = make_block_2d_prefetch(copy_a);
     auto prefetch_b = make_block_2d_prefetch(copy_b);
 
     auto thr_prefetch_A = prefetch_a.get_slice(local_id);
     auto thr_prefetch_B = prefetch_b.get_slice(local_id);
 
-    /* Partition global tensor (proxies) for prefetch */
     auto pAgA = thr_prefetch_A.partition_S(gA);
     auto pBgB = thr_prefetch_B.partition_S(gB);
 
-    /* Prefetch distance, in units of k tiles */
     const int prefetch_dist = 3;
-
-    // ------
-    // Kernel
-    // ------
-
     constexpr int barrier_scope = 2;
 
     int k_tile_count = ceil_div(shape<1>(A), get<2>(wg_tile));
     int k_tile_prefetch = 0;
 
-    /* Clear the accumulators */
     clear(tCrC);
 
-    /* Warm up loops with prefetch to L1 */
     CUTE_UNROLL
     for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
         prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
         prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
     }
 
-    /* Main loop */
     for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-        /* Split barrier keeping threads loosely together */
         barrier_arrive(barrier_scope);
 
-        /* Copy A/B from global memory (ideally L1 cache) to registers */
         copy(copy_a, tAgA(_, _, _, k_tile), tArA);
         copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
 
-        /* Prefetch A/B tiles to L1 */
         prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
         prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
 
-        /* Shuffle data from copy fragments to MMA fragments */
         reorder(tArA, tCrA);
         reorder(tBrB, tCrB);
 
-        /* Accumulate C += A * B */
         gemm(mma, tCrA, tCrB, tCrC);
-
-        /* Other half of split barrier */
         barrier_wait(barrier_scope);
     }
 
-    /* Materialize the local GEMM tile before exposing it through IPC. */
     copy(copy_c, tCrC, tCgC);
     item.barrier(sycl::access::fence_space::global_and_local);
 
-    auto* local_c_ptr = C.data().get();
     int tile_m = int(get<0>(wg_tile));
     int tile_n = int(get<1>(wg_tile));
     int tile_row_start = wg_m * tile_m;
     int tile_col_start = wg_n * tile_n;
+    int tile_row_end = std::min(tile_row_start + tile_m, m);
+    int rows_in_tile = std::max(0, tile_row_end - tile_row_start);
     int cols_in_tile = std::max(0, std::min(tile_n, n - tile_col_start));
 
-        if (cols_in_tile > 0 && tile_row_start < m) {
-                int tile_id = wg_m * num_n_tiles + wg_n;
-                if (local_id == 0) {
-                        auto* signal_base = ipc_signal_ptrs[rank];
-                        signal_base[tile_id * world_size + rank] = 1;
-                }
+    if (cols_in_tile > 0 && rows_in_tile > 0 && local_id == 0) {
+        int tile_id = wg_m * num_n_tiles + wg_n;
+        auto* signal_base = ipc_signal_ptrs[rank];
+        signal_base[tile_id * world_size + rank] = 1;
     }
 
-}
-
-template <class CTensor, class DTensor, class TiledMMA>
-void reduce_scatter_consumer_device(
-        CTensor& C,                           // (M,N) local GEMM buffer
-        DTensor& D,                           // (M,N/world_size) local reduce-scatter output
-        TiledMMA const& mma,
-        typename CTensor::element_type** ipc_c_ptrs,
-        int** ipc_signal_ptrs,
-        int rank,
-        int world_size,
-        int m,
-        int n,
-        int num_n_tiles) {
-    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
-    int wg_m = int(item.get_group(1));
-    int wg_n = int(item.get_group(0));
-    int local_id = int(item.get_local_id(0));
-    int local_threads = int(item.get_local_range(0));
-
-    int tile_m = int(get<0>(mma.tile_mnk()));
-    int tile_n = int(get<1>(mma.tile_mnk()));
-
-    int row_start = wg_m * tile_m;
-    int row_end = std::min(row_start + tile_m, m);
-    int rows = row_end - row_start;
-    if (rows <= 0) {
-        return;
-    }
-
-    int col_start = wg_n * tile_n;
-    int col_end = std::min(col_start + tile_n, n);
     int n_per_rank = n / world_size;
     int rank_col_start = rank * n_per_rank;
     int rank_col_end = rank_col_start + n_per_rank;
-    int owned_col_start = std::max(col_start, rank_col_start);
-    int owned_col_end = std::min(col_end, rank_col_end);
-    int cols = owned_col_end - owned_col_start;
-    if (cols <= 0) {
+    int owned_col_start = std::max(tile_col_start, rank_col_start);
+    int owned_col_end = std::min(tile_col_start + tile_n, rank_col_end);
+    int owned_cols = owned_col_end - owned_col_start;
+
+    if (rows_in_tile <= 0 || owned_cols <= 0) {
         return;
     }
 
     int tile_id = wg_m * num_n_tiles + wg_n;
+    int local_threads = int(item.get_local_range(0));
 
-    // Wait until every rank has produced this tile into its local C buffer.
     for (int src_rank = 0; src_rank < world_size; ++src_rank) {
         auto* signal_base = ipc_signal_ptrs[src_rank];
         while (signal_base[tile_id * world_size + src_rank] == 0) {
@@ -334,20 +267,22 @@ void reduce_scatter_consumer_device(
     auto* d_ptr = D.data().get();
     int d_ld = n_per_rank;
 
-    for (int linear_idx = local_id; linear_idx < rows * cols; linear_idx += local_threads) {
-        int row = linear_idx / cols;
-        int col = linear_idx % cols;
-        int global_row = row_start + row;
-        int global_col = owned_col_start + col;
+    // Pull from one remote producer rank (no reduction).
+    int pull_rank = (world_size > 1) ? ((rank + 1) % world_size) : rank;
+    auto* pull_c_ptr = ipc_c_ptrs[pull_rank];
 
-        float acc = 0.0f;
-        for (int src_rank = 0; src_rank < world_size; ++src_rank) {
-            auto* src_c_ptr = ipc_c_ptrs[src_rank];
-            acc += static_cast<float>(src_c_ptr[global_row * n + global_col]);
+    int d_col_offset = owned_col_start - rank_col_start;
+
+    // Iterate contiguous columns per row to avoid costly div/mod per element.
+    for (int row = 0; row < rows_in_tile; ++row) {
+        int global_row = tile_row_start + row;
+        int src_row_base = global_row * n + owned_col_start;
+        int dst_row_base = global_row * d_ld + d_col_offset;
+
+        for (int col = local_id; col < owned_cols; col += local_threads) {
+            int src_idx = src_row_base + col;
+            d_ptr[dst_row_base + col] = pull_c_ptr[src_idx];
         }
-
-        int d_col = global_col - rank_col_start;
-        d_ptr[global_row * d_ld + d_col] = static_cast<typename DTensor::element_type>(acc);
     }
 }
 
@@ -403,10 +338,6 @@ class GemmCuteName;
 template <class, class, char, char, int>
 class GemmCuteFusedName;
 
-template <class, class, char, char, int>
-class ReduceScatterConsumerName;
-
-
 // template <class EngineA, class LayoutA, class TensorB_t, class MaxTensorC_t, class TA, class TB, char LayoutA, char LayoutB>
 template <class TA, class TB, class TC, char LayoutKindA, char LayoutKindB>
 class GemmAllReduce {
@@ -422,7 +353,6 @@ class GemmAllReduce {
                    sycl::queue& Q, bool fusion_enabled = true)
                 : ar_op(m, n, k, rank, world_size, Q),
                     gemm_q(Q),
-                    rs_q(Q.get_context(), Q.get_device()),
                     fusion_enabled_(fusion_enabled) {
         if (fusion_enabled_) {
             auto mma = choose_tiled_mma(A, B, C);
@@ -491,38 +421,6 @@ class GemmAllReduce {
                     gemm_device_v2(A, B, C, D, mma,
                                    ipc_c_ptrs, ipc_signal_ptrs,
                                    rank, world_size, m, n, num_n_tiles);
-                });
-        });
-    }
-
-    template <class MMAType>
-    void reduce_scatter_consumer(sycl::queue& Q,
-                TensorC_t& C,
-                TensorD_t& D,
-                MMAType mma,
-                TC** ipc_c_ptrs,
-                int** ipc_signal_ptrs,
-                int rank,
-                int world_size,
-                int m,
-                int n,
-                int num_n_tiles) {
-        namespace syclex = sycl::ext::oneapi::experimental;
-        namespace intelex = sycl::ext::intel::experimental;
-
-        syclex::properties kernel_props{syclex::sub_group_size<16>,
-                                        intelex::grf_size<256>};
-
-        sycl::range<2> local = {size(mma), 1};
-        sycl::range<2> global = {local[0] * num_n_tiles,
-                                 local[1] * ceil_div(m, get<0>(mma.tile_mnk()))};
-        Q.submit([&](sycl::handler &h) {
-            h.parallel_for<ReduceScatterConsumerName<TA, TB, LayoutKindA, LayoutKindB, 0>>(
-                sycl::nd_range<2>(global, local), kernel_props,
-                [=](sycl::nd_item<2>) {
-                    reduce_scatter_consumer_device(
-                        C, D, mma, ipc_c_ptrs, ipc_signal_ptrs,
-                        rank, world_size, m, n, num_n_tiles);
                 });
         });
     }
@@ -636,13 +534,6 @@ class GemmAllReduce {
 
         rs_debug_log(rank, "run_fused launching fused kernel");
 
-        // Launch decoupled consumer first so it can wait for ready tiles while GEMM produces them.
-        reduce_scatter_consumer<decltype(mma)>(
-            rs_q, C, D, mma,
-            ipc_c_ptrs_, ipc_signal_ptrs_, rank, world_size,
-            m, n, num_n_tiles);
-
-        // Launch GEMM producer kernel.
         gemm_cute_fused<decltype(mma)>(
             gemm_q, A, B, C, D, mma,
             ipc_c_ptrs_, ipc_signal_ptrs_, rank, world_size,
@@ -650,7 +541,6 @@ class GemmAllReduce {
 
         rs_debug_log(rank, "run_fused kernel submitted, waiting for completion");
         gemm_q.wait_and_throw();
-        rs_q.wait_and_throw();
         rs_debug_log(rank, "run_fused complete");
     }
 
@@ -674,7 +564,6 @@ class GemmAllReduce {
 private:
     ReduceScatterOp<TA, LayoutKindA, TensorA_t, TC> ar_op;
     sycl::queue gemm_q;
-    sycl::queue rs_q;
     bool fusion_enabled_ = true;
 
     // Fused-mode IPC resources (initialized once, reused across runs).
