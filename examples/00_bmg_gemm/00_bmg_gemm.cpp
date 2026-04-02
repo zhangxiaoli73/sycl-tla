@@ -305,13 +305,9 @@ struct ExampleRunner {
 
 int main(int argc, const char** argv)
 {
-  MPI_Init(&argc, &argv);
-
-  int world_size, rank;
-  MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
-  std::cout << "MPI initialized, rank " << rank << " / " << world_size << "\n";
+  //
+  // Parse options
+  //
 
   Options options;
 
@@ -326,21 +322,6 @@ int main(int argc, const char** argv)
     std::cerr << "Aborting execution." << std::endl;
     return -1;
   }
-
-  // Explicitly select device based on rank (from gemm_reducescatter approach)
-  auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-  std::cout << "[rank " << rank << "] Found " << devices.size() << " GPU device(s):\n";
-  for (size_t i = 0; i < devices.size(); ++i) {
-    std::cout << "  [" << i << "] " << devices[i].get_info<sycl::info::device::name>() << "\n";
-  }
-  if (devices.empty()) {
-    std::cerr << "No GPU devices found\n";
-    MPI_Finalize();
-    return 1;
-  }
-  auto device = devices[rank % devices.size()];
-  std::cout << "[rank " << rank << "] Selected device[" << (rank % devices.size()) << "]: " 
-            << device.get_info<sycl::info::device::name>() << "\n";
 
   //
   // Run examples
@@ -450,10 +431,8 @@ int main(int argc, const char** argv)
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   ExampleRunner<Gemm> runner;
-  // TODO: Integrate IPC support from gemm_reducescatter
-  // For now, run standard GEMM without IPC
+
   CUTLASS_CHECK(runner.run(options, hw_info));
 
-  MPI_Finalize();
   return 0;
 }

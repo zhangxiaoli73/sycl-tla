@@ -40,6 +40,72 @@ cutlass_example_add_executable(
   TEST_SMALL_SHAPE
 )
 
+cutlass_example_add_executable(
+  00_bmg_gemm_reducescatter
+  00_bmg_gemm_reducescatter.cpp
+  TEST_COMMAND_OPTIONS
+  TEST_BATCHES
+  TEST_LARGE
+  TEST_SMALL_SHAPE
+)
+
+cutlass_example_add_executable(
+  00_bmg_allgather_gemm
+  00_bmg_allgather_gemm.cpp
+  TEST_COMMAND_OPTIONS
+  TEST_BATCHES
+  TEST_LARGE
+  TEST_SMALL_SHAPE
+)
+
+find_path(IMPI_INCLUDE_DIR mpi.h HINTS ENV I_MPI_ROOT PATH_SUFFIXES include)
+find_library(IMPI_LIBRARY NAMES mpi impi HINTS ENV I_MPI_ROOT PATH_SUFFIXES lib lib/release)
+
+if (NOT IMPI_INCLUDE_DIR OR NOT IMPI_LIBRARY)
+  message(FATAL_ERROR "00_bmg_gemm_reducescatter requires Intel MPI. Source oneAPI setvars.sh so I_MPI_ROOT is available.")
+endif()
+
+target_include_directories(
+  00_bmg_gemm_reducescatter
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+)
+
+target_include_directories(
+  00_bmg_allgather_gemm
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+)
+  target_include_directories(
+  00_bmg_gemm_reducescatter
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
+target_include_directories(
+  00_bmg_allgather_gemm
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
+  find_library(ZE_LIBRARY NAMES ze_loader
+    HINTS ENV ONEAPI_ROOT ENV LD_LIBRARY_PATH
+    PATH_SUFFIXES lib lib64)
+
+  target_link_libraries(
+    00_bmg_gemm_reducescatter
+    PRIVATE
+    ${IMPI_LIBRARY}
+    $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+  )
+
+target_link_libraries(
+  00_bmg_allgather_gemm
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)
+
 set(TEST_SMALL_SHAPE_PADDABLE --m=1 --n=1 --k=2 --l=2)
 cutlass_example_add_executable(
   00_bmg_gemm_padded
