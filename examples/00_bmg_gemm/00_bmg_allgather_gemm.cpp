@@ -282,53 +282,48 @@ struct ExampleRunner {
 
 			auto& current_q = *runner.current_q_;
 			auto& tmp_q = *runner.tmp_q_;
-
-			log("allgather_gemm iteration begin");
+			
+			// log("allgather_gemm iteration begin");
 			// q.memcpy(gathered_A + static_cast<size_t>(rank) * shard_a_elems, local_A, shard_a_bytes);
 
-			log("local shard copied, entering barrier channel 1");
+			// log("local shard copied, entering barrier channel 1");
 			// symm.barrier(1, q);
 
 			// do local GEMM first without waiting for allgather to complete, to achieve better overlap between communication and computation
-			auto local_st = runner.run_shard_gemm(
-					current_q,
-					gathered_A + static_cast<size_t>(rank) * shard_a_elems,
-					B,
-					final_C + static_cast<size_t>(rank) * shard_c_elems,
-					final_C + static_cast<size_t>(rank) * shard_c_elems,
-					options.alpha,
-					options.beta,
-					hw_info);
+			// auto local_st = runner.run_shard_gemm(
+			// 		current_q,
+			// 		gathered_A + static_cast<size_t>(rank) * shard_a_elems,
+			// 		B,
+			// 		final_C + static_cast<size_t>(rank) * shard_c_elems,
+			// 		final_C + static_cast<size_t>(rank) * shard_c_elems,
+			// 		options.alpha,
+			// 		options.beta,
+			// 		hw_info);
 
-			if (local_st != cutlass::Status::kSuccess) {
-				throw std::runtime_error("Local shard GEMM submission failed.");
-			}
-			log("local shard GEMM submitted");
+			// if (local_st != cutlass::Status::kSuccess) {
+			// 	throw std::runtime_error("Local shard GEMM submission failed.");
+			// }
+			// log("local shard GEMM submitted");
 
 			for (int step = 1; step < world_size; ++step) {
 				int remote_rank = (rank + step) % world_size;
-				int channel = step % 2;
+				int channel = 0; //step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
-				if (options.debug_log) {
-					std::cout << "[rank " << rank << "] step=" << step
-					          << " remote_rank=" << remote_rank
-					          << " channel=" << channel << std::endl;
-				}
+				// if (options.debug_log) {
+				// 	std::cout << "[rank " << rank << "] step=" << step
+				// 	          << " remote_rank=" << remote_rank
+				// 	          << " channel=" << channel << std::endl;
+				// }
 
 				ElementA* remote_src = remote_data_ptrs[remote_rank];
 				ElementA* local_dst = gathered_A + static_cast<size_t>(remote_rank) * shard_a_elems;
-				if (remote_src == nullptr || local_dst == nullptr) {
-					throw std::runtime_error(
-						"Null P2P pointer before memcpy: step=" + std::to_string(step) +
-						", remote_rank=" + std::to_string(remote_rank));
-				}
 
 				// symm.barrier(channel, queue);
-				// queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from local to remote peer buffer
+				queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from remote to local peer buffer
 
 				auto st = runner.run_shard_gemm(
 						queue,
-						local_dst,
+						local_A,
 						B,
 						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
 						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
@@ -336,15 +331,15 @@ struct ExampleRunner {
 						options.beta,
 						hw_info);
 
-				if (st != cutlass::Status::kSuccess) {
-					throw std::runtime_error("Remote shard GEMM submission failed.");
-				}
-				log("remote shard GEMM submitted");
+				// if (st != cutlass::Status::kSuccess) {
+				// 	throw std::runtime_error("Remote shard GEMM submission failed.");
+				// }
+				// log("remote shard GEMM submitted");
 
 				// symm.barrier(channel, queue);
 			}
 			// symm.barrier(0, current_q);
-			log("allgather_gemm iteration end");
+			// log("allgather_gemm iteration end");
 		}
 	};
 
