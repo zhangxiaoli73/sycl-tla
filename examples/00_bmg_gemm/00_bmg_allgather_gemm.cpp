@@ -33,6 +33,7 @@ struct Options {
 	int l = 1;
 	int iterations = 20;
 	int debug_log = 1;
+	int gemm_only = 0;
 	float alpha = 1.0f;
 	float beta = 0.0f;
 
@@ -54,6 +55,7 @@ struct Options {
 		cmd.get_cmd_line_argument("beta", beta, 0.0f);
 		cmd.get_cmd_line_argument("iterations", iterations, 20);
 		cmd.get_cmd_line_argument("debug_log", debug_log, 1);
+		cmd.get_cmd_line_argument("gemm_only", gemm_only, 0);
 	}
 
 	std::ostream& print_usage(std::ostream& out) const {
@@ -63,7 +65,8 @@ struct Options {
 				<< "  --k=<int>        K\n"
 				<< "  --l=<int>        batch count\n"
 				<< "  --iterations=<int>\n"
-				<< "  --debug_log=<int> 0/1 progress logs (default 1)\n\n";
+				<< "  --debug_log=<int> 0/1 progress logs (default 1)\n"
+				<< "  --gemm_only=<int> 0/1 run gemm_only path (default 0)\n\n";
 		return out;
 	}
 };
@@ -281,10 +284,10 @@ struct ExampleRunner {
 			auto& tmp_q = *runner.tmp_q_;
 
 			log("allgather_gemm iteration begin");
-			q.memcpy(gathered_A + static_cast<size_t>(rank) * shard_a_elems, local_A, shard_a_bytes);
+			// q.memcpy(gathered_A + static_cast<size_t>(rank) * shard_a_elems, local_A, shard_a_bytes);
 
 			log("local shard copied, entering barrier channel 1");
-			symm.barrier(1, q);
+			// symm.barrier(1, q);
 
 			// do local GEMM first without waiting for allgather to complete, to achieve better overlap between communication and computation
 			auto local_st = runner.run_shard_gemm(
@@ -320,8 +323,8 @@ struct ExampleRunner {
 						", remote_rank=" + std::to_string(remote_rank));
 				}
 
-				symm.barrier(channel, queue);
-				queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from local to remote peer buffer
+				// symm.barrier(channel, queue);
+				// queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from local to remote peer buffer
 
 				auto st = runner.run_shard_gemm(
 						queue,
@@ -338,10 +341,60 @@ struct ExampleRunner {
 				}
 				log("remote shard GEMM submitted");
 
-				symm.barrier(channel, queue);
+				// symm.barrier(channel, queue);
 			}
-			symm.barrier(0, current_q);
+			// symm.barrier(0, current_q);
 			log("allgather_gemm iteration end");
+		}
+	};
+
+	struct gemm_only {
+		ExampleRunner& runner;
+
+		void operator()(
+				sycl::queue& q,
+				ElementA* full_A,
+				ElementB* B,
+				ElementOutput* final_C,
+				Options const& options,
+				cutlass::KernelHardwareInfo const& hw_info,
+				sycl::context const&,
+				sycl::device const&,
+				int rank,
+				int world_size) const {
+			int local_m = options.m / world_size;
+			size_t shard_a_elems = static_cast<size_t>(local_m) * options.k;
+			size_t shard_c_elems = static_cast<size_t>(local_m) * options.n;
+			if (full_A == nullptr || B == nullptr || final_C == nullptr) {
+				throw std::runtime_error("gemm_only input pointer is null.");
+			}
+
+			auto log = [&](char const* msg) {
+				if (options.debug_log) {
+					std::cout << "[rank " << rank << "] " << msg << std::endl;
+				}
+			};
+
+			auto& current_q = *runner.current_q_;
+			auto& tmp_q = *runner.tmp_q_;
+
+			log("gemm_only iteration begin");
+			for (int shard = 0; shard < world_size; ++shard) {
+				auto& queue = (shard % 2 == 0) ? current_q : tmp_q;
+				auto st = runner.run_shard_gemm(
+						queue,
+						full_A + static_cast<size_t>(shard) * shard_a_elems,
+						B,
+						final_C + static_cast<size_t>(shard) * shard_c_elems,
+						final_C + static_cast<size_t>(shard) * shard_c_elems,
+						options.alpha,
+						options.beta,
+						hw_info);
+				if (st != cutlass::Status::kSuccess) {
+					throw std::runtime_error("gemm_only shard GEMM submission failed.");
+				}
+			}
+			log("gemm_only iteration end");
 		}
 	};
 
@@ -365,6 +418,25 @@ struct ExampleRunner {
 		op(q, local_A, B, final_C, symm, options, hw_info, ctx, dev, rank, world_size);
 	}
 
+	void run_iteration_gemm_only(
+			sycl::queue& q,
+			ElementA* full_A,
+			ElementB* B,
+			ElementOutput* final_C,
+			Options const& options,
+			cutlass::KernelHardwareInfo const& hw_info,
+			sycl::context const& ctx,
+			sycl::device const& dev,
+			int rank,
+			int world_size) {
+
+		gemm_only op{*this};
+		if (options.debug_log) {
+			std::cout << "[rank " << rank << "] entering gemm_only" << std::endl;
+		}
+		op(q, full_A, B, final_C, options, hw_info, ctx, dev, rank, world_size);
+	}
+
 	cutlass::Status run(
 			Options const& options,
 			cutlass::KernelHardwareInfo const& hw_info,
@@ -378,9 +450,10 @@ struct ExampleRunner {
 
 		int local_m = options.m / world_size;
 		size_t local_a_elems = static_cast<size_t>(local_m) * options.k;
+		size_t full_a_elems = static_cast<size_t>(options.m) * options.k;
 		size_t b_elems = static_cast<size_t>(options.n) * options.k;
 		size_t full_c_elems = static_cast<size_t>(options.m) * options.n;
-		if (local_a_elems == 0 || b_elems == 0 || full_c_elems == 0) {
+		if (local_a_elems == 0 || full_a_elems == 0 || b_elems == 0 || full_c_elems == 0) {
 			throw std::runtime_error("Invalid zero-sized allocation request. Check m/n/k/world_size values.");
 		}
 		if (!device.get_info<sycl::info::device::usm_device_allocations>()) {
@@ -397,26 +470,35 @@ struct ExampleRunner {
 
 		sycl::context ctx = current_q_->get_context();
 		ElementA* local_A = sycl::malloc_device<ElementA>(local_a_elems, *current_q_);
+		ElementA* full_A = nullptr;
+		if (options.gemm_only != 0) {
+			full_A = sycl::malloc_device<ElementA>(full_a_elems, *current_q_);
+		}
 		ElementB* B = sycl::malloc_device<ElementB>(b_elems, *current_q_);
 		ElementOutput* final_C = sycl::malloc_device<ElementOutput>(full_c_elems, *current_q_);
-		if (local_A == nullptr || B == nullptr || final_C == nullptr) {
+		if (local_A == nullptr || B == nullptr || final_C == nullptr || (options.gemm_only != 0 && full_A == nullptr)) {
 			auto mb = [](size_t bytes) {
 				return static_cast<double>(bytes) / (1024.0 * 1024.0);
 			};
 			throw std::runtime_error(
 				"Device allocation failed: local_A=" + std::to_string(mb(local_a_elems * sizeof(ElementA))) +
+				" MiB, full_A=" + std::to_string(mb(full_a_elems * sizeof(ElementA))) +
 				" MiB, B=" + std::to_string(mb(b_elems * sizeof(ElementB))) +
 				" MiB, final_C=" + std::to_string(mb(full_c_elems * sizeof(ElementOutput))) + " MiB.");
 		}
 
 		auto cleanup = [&]() {
 			if (local_A) sycl::free(local_A, *current_q_);
+			if (full_A) sycl::free(full_A, *current_q_);
 			if (B) sycl::free(B, *current_q_);
 			if (final_C) sycl::free(final_C, *current_q_);
 		};
 
 		initialize(local_A, B, final_C,
 				options, hw_info, device, rank, world_size);
+		if (options.gemm_only != 0) {
+			current_q_->memset(full_A, 0, full_a_elems * sizeof(ElementA)).wait();
+		}
 		if (options.debug_log) {
 			std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 		}
@@ -427,7 +509,11 @@ struct ExampleRunner {
 			std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		}
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
-			run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+			if (options.gemm_only != 0) {
+				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
+			} else {
+				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+			}
 		}
 		if (options.debug_log && rank == 0) {
 			std::cout << "[rank " << rank << "] warmup done" << std::endl;
@@ -443,7 +529,11 @@ struct ExampleRunner {
 				std::cout << "[rank " << rank << "] benchmark iteration " << iter << " start" << std::endl;
 			}
 			auto start = std::chrono::high_resolution_clock::now();
-			run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+			if (options.gemm_only != 0) {
+				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
+			} else {
+				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+			}
 			auto stop = std::chrono::high_resolution_clock::now();
 			double local_elapsed_ms = std::chrono::duration<double, std::milli>(stop - start).count();
 
