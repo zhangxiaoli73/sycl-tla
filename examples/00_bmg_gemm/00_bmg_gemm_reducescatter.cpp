@@ -401,7 +401,7 @@ struct ExampleRunner {
 			}
 		}
 
-		if (rank == 0) {
+		if (true) {
 			double avg_ms = total_ms / options.iterations;
 			double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
 			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k

@@ -316,10 +316,7 @@ T** exchange_ipc_ptrs(T* local_ptr, int rank, int world_size, sycl::queue& q, st
   ::unlink(local_socket.c_str());
 #endif
 
-  T** ptrs = sycl::malloc_shared<T*>(world_size, q);
-  if (ptrs == nullptr) {
-    throw std::runtime_error("exchange_ipc_ptrs failed to allocate pointer table");
-  }
+  T** ptrs = new T*[world_size];
   for (int peer = 0; peer < world_size; ++peer) {
     if (peer == rank) {
       ptrs[peer] = local_ptr;
@@ -377,6 +374,29 @@ class SymmMemory {
 
     remote_signal_ptrs_ = exchange_ipc_ptrs(local_signal_ptr_, rank_, world_size_, init_q_, opened_signal_bases_);
     remote_data_ptrs_ = exchange_ipc_ptrs(local_data_ptr_, rank_, world_size_, init_q_, opened_data_bases_);
+
+    // make remote IPC memory resident on local device
+    auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_context());
+    auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_device());
+
+    for (int peer = 0; peer < world_size_; ++peer) {
+      if (peer == rank_) continue;
+      auto res = zeContextMakeMemoryResident(ze_ctx, ze_dev, remote_signal_ptrs_[peer],
+          signal_elems * sizeof(uint32_t));
+      if (res != ZE_RESULT_SUCCESS) {
+        throw std::runtime_error("zeContextMakeMemoryResident failed for remote signal ptr of peer " + std::to_string(peer));
+      }
+    }
+
+    for (int peer = 0; peer < world_size_; ++peer) {
+      if (peer == rank_) continue;
+      auto res = zeContextMakeMemoryResident(ze_ctx, ze_dev, remote_data_ptrs_[peer],
+          data_elems * sizeof(uint16_t));
+      if (res != ZE_RESULT_SUCCESS) {
+        throw std::runtime_error("zeContextMakeMemoryResident failed for remote data ptr of peer " + std::to_string(peer));
+      }
+    }
+
   }
 
   ~SymmMemory() {
@@ -384,13 +404,11 @@ class SymmMemory {
     close_ipc_ptrs(init_q_, opened_data_bases_);
 
     if (remote_signal_ptrs_) {
-      sycl::free(remote_signal_ptrs_, init_q_);
+      delete[] remote_signal_ptrs_;
       remote_signal_ptrs_ = nullptr;
     }
-    if (remote_data_ptrs_) {
-      sycl::free(remote_data_ptrs_, init_q_);
-      remote_data_ptrs_ = nullptr;
-    }
+    delete[] remote_data_ptrs_;
+    remote_data_ptrs_ = nullptr;
     if (local_signal_ptr_) {
       sycl::free(local_signal_ptr_, init_q_);
       local_signal_ptr_ = nullptr;
@@ -470,13 +488,13 @@ class SymmMemory {
     assert(dst_rank >= 0 && dst_rank < world_size_);
 
     uint32_t ticket = ++local_epoch_[channel];
-    uint32_t** pads = remote_signal_ptrs_;
     int rank = rank_;
     int base = channel * world_size_;
+    uint32_t* remote_pad = remote_signal_ptrs_[dst_rank];
 
     init_q_.submit([&](sycl::handler& h) {
       h.single_task([=]() {
-        uint32_t* remote_slot = pads[dst_rank] + base + rank;
+        uint32_t* remote_slot = remote_pad + base + rank;
         *remote_slot = ticket;
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
       });
@@ -489,13 +507,13 @@ class SymmMemory {
     assert(src_rank >= 0 && src_rank < world_size_);
 
     uint32_t ticket = local_epoch_[channel];
-    uint32_t** pads = remote_signal_ptrs_;
     int rank = rank_;
     int base = channel * world_size_;
+    uint32_t* my_pad = remote_signal_ptrs_[rank];
 
     init_q_.submit([&](sycl::handler& h) {
       h.single_task([=]() {
-        uint32_t* wait_slot = pads[rank] + base + src_rank;
+        uint32_t* wait_slot = my_pad + base + src_rank;
         while (true) {
           sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
           if (*wait_slot >= ticket) {

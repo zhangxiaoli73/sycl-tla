@@ -58,6 +58,15 @@ cutlass_example_add_executable(
   TEST_SMALL_SHAPE
 )
 
+cutlass_example_add_executable(
+  00_bmg_debug
+  00_bmg_debug.cpp
+  TEST_COMMAND_OPTIONS
+  TEST_BATCHES
+  TEST_LARGE
+  TEST_SMALL_SHAPE
+)
+
 find_path(IMPI_INCLUDE_DIR mpi.h HINTS ENV I_MPI_ROOT PATH_SUFFIXES include)
 find_library(IMPI_LIBRARY NAMES mpi impi HINTS ENV I_MPI_ROOT PATH_SUFFIXES lib lib/release)
 
@@ -76,6 +85,12 @@ target_include_directories(
   PRIVATE
   ${IMPI_INCLUDE_DIR}
 )
+
+target_include_directories(
+  00_bmg_debug
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+)
   target_include_directories(
   00_bmg_gemm_reducescatter
   PRIVATE
@@ -84,6 +99,12 @@ target_include_directories(
 
 target_include_directories(
   00_bmg_allgather_gemm
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
+target_include_directories(
+  00_bmg_debug
   PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
 )
@@ -101,6 +122,13 @@ target_include_directories(
 
 target_link_libraries(
   00_bmg_allgather_gemm
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)
+
+target_link_libraries(
+  00_bmg_debug
   PRIVATE
   ${IMPI_LIBRARY}
   $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
