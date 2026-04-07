@@ -26,9 +26,9 @@ using namespace cute;
 struct Options {
 	bool help = false;
 	bool error = false;
-	int m = 5120;
+	int m = 8192;
 	int n = 4096;
-	int k = 4096;
+	int k = 3584;
 	int l = 1;
 	int iterations = 20;
 	int debug_log = 1;
@@ -45,9 +45,9 @@ struct Options {
 			help = true;
 			return;
 		}
-		cmd.get_cmd_line_argument("m", m, 5120);
+		cmd.get_cmd_line_argument("m", m, 8192);
 		cmd.get_cmd_line_argument("n", n, 4096);
-		cmd.get_cmd_line_argument("k", k, 4096);
+		cmd.get_cmd_line_argument("k", k, 3584);
 		cmd.get_cmd_line_argument("l", l, 1);
 		cmd.get_cmd_line_argument("alpha", alpha, 1.0f);
 		cmd.get_cmd_line_argument("beta", beta, 0.0f);
@@ -93,6 +93,13 @@ struct ExampleRunner {
 	std::unique_ptr<sycl::queue> tmp_q_;
 	std::unique_ptr<SymmMemory> symm_;
 	Gemm gemm_op_;
+
+	size_t chunk_elements_ = 0;
+	size_t total_elements_ = 0;
+	ElementOutput* local_p2p_ = nullptr;
+	ElementOutput* stacked_partials_ = nullptr;
+	std::vector<void*> remote_p2p_ptrs_;
+	std::vector<void*> opened_p2p_bases_;
 
 	void initialize(
 			ElementA* block_A,
@@ -142,6 +149,11 @@ struct ExampleRunner {
 		stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(options.n, options.k, options.l));
 		stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(options.m, options.n, options.l));
 		stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(options.m, options.n, options.l));
+
+		if (options.debug_log) {
+			printf("[rank %d] GEMM shard per call: M=%d N=%d K=%d L=%d\n",
+					rank, local_rows, options.n, options.k, options.l);
+		}
 
 		chunk_elements_ = static_cast<size_t>(local_rows) * options.n * options.l;
 		total_elements_ = static_cast<size_t>(options.m) * options.n * options.l;
@@ -232,28 +244,31 @@ struct ExampleRunner {
 			size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
 			size_t shard_bytes = shard_c_elems * sizeof(ElementOutput);
 
-			ElementA* local_p2p_ = reinterpret_cast<ElementA*>(symm.local_data_ptr());
-			auto remote_p2p_ptrs_ = reinterpret_cast<ElementA**>(symm.remote_data_ptrs());
+			ElementOutput* local_p2p_ = reinterpret_cast<ElementOutput*>(symm.local_data_ptr_);
+			auto& remote_p2p_ptrs_ = symm.remote_data_ptrs_;
 
-			if (runner.local_p2p_ == nullptr || runner.remote_p2p_ptrs_ == nullptr) {
+			if (runner.local_p2p_ == nullptr || runner.remote_p2p_ptrs_.empty()) {
 				throw std::runtime_error("IPC pointers are null.");
 			}
 
 			auto& current_q = *runner.current_q_;
 			auto& tmp_q = *runner.tmp_q_;
-			
+
+			symm.barrier(0, current_q);
+
 			// Phase 1+2: run local GEMM for each shard and push to destination peer.
 			for (int step = 1; step < world_size; ++step) {
 				int dst_rank = (rank + step) % world_size;
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
+				// step1: tmp_q, step2, current_q, step3: tmp_q
 
 				ElementOutput* local_shard_out = local_p2p_ + static_cast<size_t>(step - 1) * shard_c_elems;
 				auto st = runner.run_shard_gemm(queue, block_A, block_B, block_C,
 				                              options, hw_info, dst_rank, local_rows, local_shard_out);
 				if (st != cutlass::Status::kSuccess)
 					throw std::runtime_error("run_shard_gemm (remote shard) failed.");
-				ElementOutput* remote_dst = remote_p2p_ptrs_[dst_rank] + static_cast<size_t>(step - 1) * shard_c_elems;
+				ElementOutput* remote_dst = reinterpret_cast<ElementOutput*>(remote_p2p_ptrs_[dst_rank]) + static_cast<size_t>(step - 1) * shard_c_elems;
 				queue.memcpy(remote_dst, local_shard_out, shard_bytes);
 			}
 
@@ -262,6 +277,7 @@ struct ExampleRunner {
 			if (st_local != cutlass::Status::kSuccess)
 				throw std::runtime_error("run_shard_gemm (local shard) failed.");
 
+			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
 			symm.barrier(0, current_q);
 
 			// Phase 3: local reduction for this rank's shard.
@@ -279,9 +295,6 @@ struct ExampleRunner {
 						local_partial[idx[0]] = acc;
 					});
 				});
-			}
-			if (options.debug_log) {
-				std::cout << "[rank " << rank << "] reduce phase done" << std::endl;
 			}
 		}
 	};
@@ -308,12 +321,19 @@ struct ExampleRunner {
 			int rank,
 			int world_size) {
 
-		if (options.m % world_size != 0)
+		if (options.m % world_size != 0) {
 			throw std::runtime_error("GEMM+reduce-scatter requires M divisible by world_size.");
+		}
 
 		size_t a_elems = static_cast<size_t>(options.m) * options.k * options.l;
 		size_t b_elems = static_cast<size_t>(options.n) * options.k * options.l;
 		size_t c_elems = static_cast<size_t>(options.m) * options.n * options.l;
+		if (a_elems == 0 || b_elems == 0 || c_elems == 0) {
+			throw std::runtime_error("Invalid zero-sized allocation request. Check m/n/k/world_size values.");
+		}
+		if (!device.get_info<sycl::info::device::usm_device_allocations>()) {
+			throw std::runtime_error("Selected SYCL device does not support USM device allocations.");
+		}
 
 		if (!current_q_) {
 			auto queue_context = sycl::context(device);
@@ -326,8 +346,19 @@ struct ExampleRunner {
 		ElementA* block_A = sycl::malloc_device<ElementA>(a_elems, *current_q_);
 		ElementB* block_B = sycl::malloc_device<ElementB>(b_elems, *current_q_);
 		ElementC* block_C = sycl::malloc_device<ElementC>(c_elems, *current_q_);
+		auto mb = [](size_t bytes) {
+			return static_cast<double>(bytes) / (1024.0 * 1024.0);
+		};
+		printf("[rank %d] Allocated: A=%.2f MiB, B=%.2f MiB, C=%.2f MiB\n",
+				rank,
+				mb(a_elems * sizeof(ElementA)),
+				mb(b_elems * sizeof(ElementB)),
+				mb(c_elems * sizeof(ElementC)));
 		if (block_A == nullptr || block_B == nullptr || block_C == nullptr) {
-			throw std::runtime_error("Device allocation failed.");
+			throw std::runtime_error(
+				"Device allocation failed: A=" + std::to_string(mb(a_elems * sizeof(ElementA))) +
+				" MiB, B=" + std::to_string(mb(b_elems * sizeof(ElementB))) +
+				" MiB, C=" + std::to_string(mb(c_elems * sizeof(ElementC))) + " MiB.");
 		}
 
 		auto cleanup = [&]() {
@@ -335,15 +366,14 @@ struct ExampleRunner {
 			if (block_B) sycl::free(block_B, *current_q_);
 			if (block_C) sycl::free(block_C, *current_q_);
 			close_ipc_ptrs(*current_q_, opened_p2p_bases_);
-			if (remote_p2p_ptrs_) { sycl::free(remote_p2p_ptrs_, *current_q_); remote_p2p_ptrs_ = nullptr; }
+			remote_p2p_ptrs_.clear();
 			if (local_p2p_)       { sycl::free(local_p2p_,       *current_q_); local_p2p_ = nullptr; }
 			if (stacked_partials_){ sycl::free(stacked_partials_, *current_q_); stacked_partials_ = nullptr; }
 		};
 
 		initialize(block_A, block_B, block_C, options, hw_info, device, rank, world_size);
-		if (options.debug_log) {
-			std::cout << "[rank " << rank << "] initialization complete" << std::endl;
-		}
+		MPI_Barrier(MPI_COMM_WORLD);
+		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 
 		// warmup
 		constexpr int kWarmupIters = 10;
@@ -352,40 +382,38 @@ struct ExampleRunner {
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
 			run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
 		}
+
 		current_q_->wait();
-		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 		MPI_Barrier(MPI_COMM_WORLD); // ensure all ranks have finished warmup before starting benchmark iterations
+		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
 		// benchmark
-		std::vector<std::array<sycl::event, 2>> benchmark_events;
-		benchmark_events.reserve(options.iterations);
+		auto ev_before = current_q_->ext_oneapi_submit_barrier();
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			auto ev_before = current_q_->ext_oneapi_submit_barrier();
 			run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
-			auto ev_after = current_q_->ext_oneapi_submit_barrier();
-			benchmark_events.push_back({ev_before, ev_after});
 		}
 		auto benchmark_stop = std::chrono::high_resolution_clock::now();
+		auto ev_after = current_q_->ext_oneapi_submit_barrier();
 		current_q_->wait();
+
 		MPI_Barrier(MPI_COMM_WORLD);
 
 		double total_ms = std::chrono::duration<double, std::milli>(benchmark_stop - benchmark_start).count();
-		double total_device_ms = 0.0;
-		for (auto const& event_pair : benchmark_events) {
-			auto dev_start_ns = event_pair[0].get_profiling_info<sycl::info::event_profiling::command_end>();
-			auto dev_end_ns   = event_pair[1].get_profiling_info<sycl::info::event_profiling::command_start>();
-			total_device_ms += static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
-		}
+		auto dev_start_ns = ev_before.get_profiling_info<sycl::info::event_profiling::command_end>();
+		auto dev_end_ns   = ev_after.get_profiling_info<sycl::info::event_profiling::command_start>();
+		double total_device_ms = static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
 			double avg_device_ms = total_device_ms / options.iterations;
+			int local_rows = options.m / world_size;
 			double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
-			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
+			std::cout << "[" << rank << "] Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
 			          << 'x' << options.l << ", TP=" << world_size << std::endl;
-			printf("Pipelined GEMM + Reduce-Scatter (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_ms / 1000.0), avg_ms);
-			printf("Pipelined GEMM + Reduce-Scatter (device): [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_device_ms / 1000.0), avg_device_ms);
+			printf("[%d] GEMM shard per call: M=%d N=%d K=%d\n", rank, local_rows, options.n, options.k);
+			printf("[%d] Pipelined GEMM + Reduce-Scatter (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", rank, tflops / (avg_ms / 1000.0), avg_ms);
+			printf("[%d] Pipelined GEMM + Reduce-Scatter (device): [%4.3f]TFlop/s  (%6.4f)ms\n", rank, tflops / (avg_device_ms / 1000.0), avg_device_ms);
 		}
 
 		cleanup();

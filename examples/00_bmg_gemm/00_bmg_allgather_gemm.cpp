@@ -164,7 +164,7 @@ struct ExampleRunner {
 		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(gemm_m, n, 1));
 
 		if (options.debug_log) {
-			std::printf("[rank %d] GEMM problem per call: M=%d N=%d K=%d (gemm_only=%d)\n",
+			printf("[rank %d] GEMM problem per call: M=%d N=%d K=%d (gemm_only=%d)\n",
 					rank, gemm_m, n, k, options.gemm_only);
 		}
 
@@ -311,6 +311,7 @@ struct ExampleRunner {
 					throw std::runtime_error("allgather_gemm shard GEMM submission failed.");
 				}
 			}
+			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
 			symm.barrier(0, current_q);
 		}
 	};
@@ -428,7 +429,7 @@ struct ExampleRunner {
 		auto mb = [](size_t bytes) {
 			return static_cast<double>(bytes) / (1024.0 * 1024.0);
 		};
-		std::printf("[rank %d] Allocated: local_A=%.2f MiB, full_A=%.2f MiB, B=%.2f MiB, final_C=%.2f MiB\n",
+		printf("[rank %d] Allocated: local_A=%.2f MiB, full_A=%.2f MiB, B=%.2f MiB, final_C=%.2f MiB\n",
 				rank,
 				mb(local_a_elems * sizeof(ElementA)),
 				mb(options.gemm_only != 0 ? full_a_elems * sizeof(ElementA) : 0),
@@ -473,32 +474,25 @@ struct ExampleRunner {
 		MPI_Barrier(MPI_COMM_WORLD); // ensure all ranks have finished warmup before starting benchmark iterations
 		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
-		std::vector<std::array<sycl::event, 2>> benchmark_events;
-		benchmark_events.reserve(options.iterations);
 		// benchmark
+		auto ev_before = current_q_->ext_oneapi_submit_barrier();
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			auto ev_before = current_q_->ext_oneapi_submit_barrier();
 			if (options.gemm_only != 0) {
 				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
 			} else {
 				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
 			}
-			auto ev_after = current_q_->ext_oneapi_submit_barrier();
-			benchmark_events.push_back({ev_before, ev_after});
-
 		}
 		auto benchmark_stop = std::chrono::high_resolution_clock::now();
-        current_q_->wait();
+		auto ev_after = current_q_->ext_oneapi_submit_barrier();
+		current_q_->wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
 		double total_ms = std::chrono::duration<double, std::milli>(benchmark_stop - benchmark_start).count();
-		double total_device_ms = 0.0;
-		for (auto const& event_pair : benchmark_events) {
-			auto dev_start_ns = event_pair[0].get_profiling_info<sycl::info::event_profiling::command_end>();
-			auto dev_end_ns   = event_pair[1].get_profiling_info<sycl::info::event_profiling::command_start>();
-			total_device_ms += static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
-		}
+		auto dev_start_ns = ev_before.get_profiling_info<sycl::info::event_profiling::command_end>();
+		auto dev_end_ns   = ev_after.get_profiling_info<sycl::info::event_profiling::command_start>();
+		double total_device_ms = static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
 		
 
 		if (true) {
