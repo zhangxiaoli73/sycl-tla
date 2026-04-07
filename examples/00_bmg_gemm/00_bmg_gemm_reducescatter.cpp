@@ -93,13 +93,6 @@ struct ExampleRunner {
 	std::unique_ptr<sycl::queue> tmp_q_;
 	std::unique_ptr<SymmMemory> symm_;
 	Gemm gemm_op_;
-	// IPC pipeline state — one slot per remote step (step in 1..world_size-1)
-	ElementOutput* local_p2p_ = nullptr;
-	ElementOutput** remote_p2p_ptrs_ = nullptr;
-	ElementOutput* stacked_partials_ = nullptr;
-	std::vector<void*> opened_p2p_bases_;
-	size_t chunk_elements_ = 0;
-	size_t total_elements_ = 0;
 
 	void initialize(
 			ElementA* block_A,
@@ -239,6 +232,9 @@ struct ExampleRunner {
 			size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
 			size_t shard_bytes = shard_c_elems * sizeof(ElementOutput);
 
+			ElementA* local_p2p_ = reinterpret_cast<ElementA*>(symm.local_data_ptr());
+			auto remote_p2p_ptrs_ = reinterpret_cast<ElementA**>(symm.remote_data_ptrs());
+
 			if (runner.local_p2p_ == nullptr || runner.remote_p2p_ptrs_ == nullptr) {
 				throw std::runtime_error("IPC pointers are null.");
 			}
@@ -252,18 +248,17 @@ struct ExampleRunner {
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
 
-				ElementOutput* local_shard_out = runner.local_p2p_ + static_cast<size_t>(step - 1) * shard_c_elems;
+				ElementOutput* local_shard_out = local_p2p_ + static_cast<size_t>(step - 1) * shard_c_elems;
 				auto st = runner.run_shard_gemm(queue, block_A, block_B, block_C,
 				                              options, hw_info, dst_rank, local_rows, local_shard_out);
 				if (st != cutlass::Status::kSuccess)
 					throw std::runtime_error("run_shard_gemm (remote shard) failed.");
-				ElementOutput* remote_dst = runner.remote_p2p_ptrs_[dst_rank] + static_cast<size_t>(step - 1) * shard_c_elems;
+				ElementOutput* remote_dst = remote_p2p_ptrs_[dst_rank] + static_cast<size_t>(step - 1) * shard_c_elems;
 				queue.memcpy(remote_dst, local_shard_out, shard_bytes);
 			}
 
 			auto st_local = runner.run_shard_gemm(current_q, block_A, block_B, block_C,
-			                                    options, hw_info, rank, local_rows,
-			                                    runner.stacked_partials_ + local_off);
+			                                    options, hw_info, rank, local_rows, local_p2p_ + local_off);
 			if (st_local != cutlass::Status::kSuccess)
 				throw std::runtime_error("run_shard_gemm (local shard) failed.");
 
@@ -271,8 +266,8 @@ struct ExampleRunner {
 
 			// Phase 3: local reduction for this rank's shard.
 			{
-				ElementOutput* local_partial = runner.stacked_partials_ + local_off;
-				ElementOutput* recv_slots = runner.local_p2p_;
+				ElementOutput* local_partial = local_p2p_ + local_off;
+				ElementOutput* recv_slots = local_p2p_;
 				int ws = world_size;
 				size_t ce = shard_c_elems;
 				current_q.submit([&](sycl::handler& h) {

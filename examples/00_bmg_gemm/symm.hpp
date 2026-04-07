@@ -366,21 +366,29 @@ class SymmMemory {
     size_t data_elems = static_cast<size_t>(m) * k * world_size_; // 16-bit elements
     size_t signal_elems = static_cast<size_t>(num_channels_) * world_size_;
 
+    std::cout << "zl_debug start to malloc local buffer and flag " << std::endl;
     local_signal_ptr_ = sycl::malloc_device<uint32_t>(signal_elems, init_q_);
     local_data_ptr_ = sycl::malloc_device<uint16_t>(data_elems, init_q_);
+    std::cout << "zl_debug finish malloc local buffer and flag " << std::endl;
 
     init_q_.memset(local_signal_ptr_, 0, signal_elems * sizeof(uint32_t)).wait();
     init_q_.memset(local_data_ptr_, 0, data_elems * sizeof(uint16_t)).wait();
-
+    
+    std::cout << "zl_debug start to do IPC exchange " << std::endl;
     remote_signal_ptrs_ = exchange_ipc_ptrs(local_signal_ptr_, rank_, world_size_, init_q_, opened_signal_bases_);
     remote_data_ptrs_ = exchange_ipc_ptrs(local_data_ptr_, rank_, world_size_, init_q_, opened_data_bases_);
+    std::cout << "zl_debug finish the IPC exchange " << std::endl;
 
     // make remote IPC memory resident on local device
     auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_context());
     auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_device());
-
+    
+    std::cout << "zl_debug start to make resident" << std::endl;
     for (int peer = 0; peer < world_size_; ++peer) {
       if (peer == rank_) continue;
+      if (remote_signal_ptrs_[peer] == nullptr) {
+        throw std::runtime_error("SymmMemory remote_signal_ptr is null for peer " + std::to_string(peer));
+      }
       auto res = zeContextMakeMemoryResident(ze_ctx, ze_dev, remote_signal_ptrs_[peer],
           signal_elems * sizeof(uint32_t));
       if (res != ZE_RESULT_SUCCESS) {
@@ -390,13 +398,16 @@ class SymmMemory {
 
     for (int peer = 0; peer < world_size_; ++peer) {
       if (peer == rank_) continue;
+      if (remote_data_ptrs_[peer] == nullptr) {
+        throw std::runtime_error("SymmMemory remote_data_ptr is null for peer " + std::to_string(peer));
+      }
       auto res = zeContextMakeMemoryResident(ze_ctx, ze_dev, remote_data_ptrs_[peer],
           data_elems * sizeof(uint16_t));
       if (res != ZE_RESULT_SUCCESS) {
         throw std::runtime_error("zeContextMakeMemoryResident failed for remote data ptr of peer " + std::to_string(peer));
       }
     }
-
+    std::cout << "zl_debug finish making resident" << std::endl;
   }
 
   ~SymmMemory() {
@@ -457,11 +468,11 @@ class SymmMemory {
       if (peer == rank) {
         continue;
       }
-      uint32_t* remote_slot = remote_signal_ptrs_[peer] + rank;
+      uint32_t* remote_slot = reinterpret_cast<uint32_t*>(remote_signal_ptrs_[peer]);
       if (remote_slot) {
         throw std::runtime_error("SymmMemory barrier remote_slot is null, unexpected.");
       }
-      queue.memset(remote_slot, 0, sizeof(uint32_t)).wait();
+      queue.memset(remote_slot, 0, world_size_ * sizeof(uint32_t)).wait();
     }
 
     std::cout << "zl_debug memset done" << std::endl;
