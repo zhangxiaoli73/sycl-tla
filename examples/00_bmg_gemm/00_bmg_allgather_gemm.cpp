@@ -129,7 +129,7 @@ struct ExampleRunner {
 			current_q_ = std::make_unique<sycl::queue>(
 					ctx,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+					sycl::property_list{sycl::property::queue::in_order{}});
 			log_init("current_q created");
 		}
 
@@ -147,7 +147,7 @@ struct ExampleRunner {
 			tmp_q_ = std::make_unique<sycl::queue>(
 					ctx,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+					sycl::property_list{sycl::property::queue::in_order{}});
 			log_init("tmp_q created");
 		}
 
@@ -425,7 +425,7 @@ struct ExampleRunner {
 			current_q_ = std::make_unique<sycl::queue>(
 					queue_context,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+					sycl::property_list{sycl::property::queue::in_order{}});
 		}
 
 		sycl::context ctx = current_q_->get_context();
@@ -459,9 +459,8 @@ struct ExampleRunner {
 		if (options.gemm_only != 0) {
 			current_q_->memset(full_A, 0, full_a_elems * sizeof(ElementA)).wait();
 		}
-		if (options.debug_log) {
-			std::cout << "[rank " << rank << "] initialization complete" << std::endl;
-		}
+		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
+		return;
 
 		// warmup
 		constexpr int kWarmupIters = 10;

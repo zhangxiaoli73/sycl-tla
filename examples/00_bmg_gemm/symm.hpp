@@ -11,6 +11,7 @@
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
 #include <vector>
+#include "ipc_exchange.hpp"
 
 #include <level_zero/ze_api.h>
 
@@ -408,6 +409,7 @@ class SymmMemory {
       }
     }
     std::cout << "zl_debug finish making resident" << std::endl;
+    MPI_Barrier(MPI_COMM_WORLD);
   }
 
   ~SymmMemory() {
@@ -462,21 +464,6 @@ class SymmMemory {
     int rank = rank_;
     int world_size = world_size_;
     int base = barrier_channel * world_size_;
-    std::cout << "zl_debug start to do memset " << std::endl;
-    // memset to 0 before the first barrier
-     for (int peer = 0; peer < world_size; ++peer) {
-      if (peer == rank) {
-        continue;
-      }
-      uint32_t* remote_slot = reinterpret_cast<uint32_t*>(remote_signal_ptrs_[peer]);
-      if (remote_slot) {
-        throw std::runtime_error("SymmMemory barrier remote_slot is null, unexpected.");
-      }
-      queue.memset(remote_slot, 0, world_size_ * sizeof(uint32_t)).wait();
-    }
-
-    std::cout << "zl_debug memset done" << std::endl;
-    return;
 
     queue.submit([&](sycl::handler& h) {
       h.single_task([=]() {
@@ -486,24 +473,24 @@ class SymmMemory {
             continue;
           }
           uint32_t* remote_slot = pads[peer] + base + rank;
-          remote_slot[0] = 0;
+          *remote_slot = ticket;
           sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         }
 
         // wait_signal from all peers
-        // uint32_t* my_pad = pads[rank] + base;
-        // for (int peer = 0; peer < world_size; ++peer) {
-        //   if (peer == rank) {
-        //     continue;
-        //   }
-        //   while (true) {
-        //     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-        //     uint32_t* wait_slot = my_pad + peer;
-        //     if (*wait_slot >= ticket) {
-        //       break;
-        //     }
-        //   }
-        // }
+        uint32_t* my_pad = pads[rank] + base;
+        for (int peer = 0; peer < world_size; ++peer) {
+          if (peer == rank) {
+            continue;
+          }
+          uint32_t* wait_slot = my_pad + peer;
+          while (true) {
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+            if (*wait_slot >= ticket) {
+              break;
+            }
+          }
+        }
       });
     });
   }
