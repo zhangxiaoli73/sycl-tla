@@ -293,7 +293,8 @@ struct ExampleRunner {
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
 
-				ElementA* remote_src = reinterpret_cast<ElementA*>(symm.get_data_buffer(remote_rank));
+				ElementA* remote_buf = reinterpret_cast<ElementA*>(symm.get_data_buffer(remote_rank));
+				ElementA* remote_src = remote_buf + static_cast<size_t>(remote_rank) * shard_a_elems;
 				ElementA* local_dst = gathered_A + static_cast<size_t>(remote_rank) * shard_a_elems;
 
 				if (remote_src == nullptr || local_dst == nullptr) {

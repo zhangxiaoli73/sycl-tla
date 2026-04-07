@@ -110,11 +110,50 @@ inline void close_ipc_ptrs(sycl::queue& q, std::vector<void*>& opened_ptrs) {
   opened_ptrs.clear();
 }
 
+// --------------- Signal primitives (following torch-xpu-ops) ---------------
+// Uses store/load + atomic_fence (sycl::atomic_ref not supported on all targets)
+
+inline void store_release(uint32_t* addr, uint32_t val) {
+  *addr = val;
+  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+}
+
+inline uint32_t load_acquire(uint32_t* addr) {
+  sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+  uint32_t val = *addr;
+  return val;
+}
+
+// put_signal: wait until addr == 0, then set to 1 (release semantics)
+inline bool try_put_signal_device(uint32_t* addr, size_t max_iterations = 10000000) {
+  size_t iterations = 0;
+  while (load_acquire(addr) != 0) {
+    if (max_iterations != 0 && iterations++ > max_iterations) {
+      return false;
+    }
+  }
+  store_release(addr, 1);
+  return true;
+}
+
+// wait_signal: wait until addr == 1, then set to 0 (acquire semantics)
+inline bool try_wait_signal_device(uint32_t* addr, size_t max_iterations = 10000000) {
+  size_t iterations = 0;
+  while (load_acquire(addr) != 1) {
+    if (max_iterations != 0 && iterations++ > max_iterations) {
+      return false;
+    }
+  }
+  store_release(addr, 0);
+  return true;
+}
+
 // ---------------- Symmetric-memory style signal barrier ----------------
 
 // This class provides barrier/put_signal/wait_signal semantics similar to
 // XPUSymmetricMemory. Each rank owns one signal pad, IPC-opens all peer pads,
 // and stores per-channel tickets in layout: [channel][src_rank].
+
 class SymmMemory {
  public:
   SymmMemory(int m, int n, int k, int rank, int world_size, sycl::queue& q, int num_channels = 1024)
@@ -159,6 +198,17 @@ class SymmMemory {
     remote_data_ptrs_ = exchange_ipc_ptrs(local_data_ptr_, rank_, world_size_, init_q_, opened_data_bases_);
     std::cout << "zl_debug finish the IPC exchange " << std::endl;
 
+    // Allocate device buffer and copy remote signal pointers for barrier kernel
+    remote_signal_ptrs_dev_ = sycl::malloc_device<uint32_t*>(world_size_, init_q_);
+    if (remote_signal_ptrs_dev_ == nullptr) {
+      throw std::runtime_error("SymmMemory: failed to allocate remote_signal_ptrs_dev_");
+    }
+    std::vector<uint32_t*> host_pads(world_size_);
+    for (int i = 0; i < world_size_; ++i) {
+      host_pads[i] = reinterpret_cast<uint32_t*>(remote_signal_ptrs_[i]);
+    }
+    init_q_.memcpy(remote_signal_ptrs_dev_, host_pads.data(), world_size_ * sizeof(uint32_t*)).wait();
+
     // make remote IPC memory resident on local device
     auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_context());
     auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_device());
@@ -197,6 +247,10 @@ class SymmMemory {
 
     remote_signal_ptrs_.clear();
     remote_data_ptrs_.clear();
+    if (remote_signal_ptrs_dev_) {
+      sycl::free(remote_signal_ptrs_dev_, init_q_);
+      remote_signal_ptrs_dev_ = nullptr;
+    }
     if (local_signal_ptr_) {
       sycl::free(local_signal_ptr_, init_q_);
       local_signal_ptr_ = nullptr;
@@ -229,59 +283,34 @@ class SymmMemory {
   }
 
   void barrier(int channel, sycl::queue& queue, size_t timeout_ms = 0) {
+    channel = 0; // todo: channel =0 as temp solution
     (void)timeout_ms;
-    (void)channel;
-
-    constexpr int barrier_channel = 0;
-
-    uint32_t ticket = ++local_epoch_[barrier_channel];
     int rank = rank_;
     int world_size = world_size_;
-    int base = barrier_channel * world_size_;
-    std::cout << "zl_debug start to do memset " << std::endl;
-    // memset to 0 before the first barrier
-     for (int peer = 0; peer < world_size; ++peer) {
-      if (peer == rank) {
-        continue;
-      }
-      uint32_t* remote_slot = reinterpret_cast<uint32_t*>(remote_signal_ptrs_[peer]);
-      if (remote_slot == nullptr) {
-        throw std::runtime_error("SymmMemory barrier remote_slot is null, unexpected.");
-      }
-      queue.memset(remote_slot, 0, world_size_ * sizeof(uint32_t)).wait();
-    }
+    uint32_t** pads = remote_signal_ptrs_dev_;
 
-    std::cout << "zl_debug memset done" << std::endl;
-    return;
-
-//    queue.submit([&](sycl::handler& h) {
-//      h.single_task([=]() {
-//        // put_signal to all peers
-//        for (int peer = 0; peer < world_size; ++peer) {
-//          if (peer == rank) {
-//            continue;
-//          }
-//          uint32_t* remote_slot = reinterpret_cast<uint32_t*>(pads[peer]) + base + rank;
-//          remote_slot[0] = 0;
-//          sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-//        }
-//
-//         wait_signal from all peers
-//         uint32_t* my_pad = pads[rank] + base;
-//         for (int peer = 0; peer < world_size; ++peer) {
-//           if (peer == rank) {
-//             continue;
-//           }
-//           while (true) {
-//             sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-//             uint32_t* wait_slot = my_pad + peer;
-//             if (*wait_slot >= ticket) {
-//               break;
-//             }
-//           }
-//         }
-//      });
-//    });
+    // Following torch-xpu-ops barrierKernel pattern:
+    // signal_pads layout: signal_pads[target_rank][world_size * channel + src_rank]
+    // put_signal: wait until slot==0, then write 1 (release)
+    // wait_signal: wait until slot==1, then write 0 (acquire)
+    queue.submit([&](sycl::handler& h) {
+      h.parallel_for(sycl::nd_range<1>(std::max(32, world_size), std::max(32, world_size)),
+        [=](sycl::nd_item<1> item) {
+          auto thread_id = item.get_local_id(0);
+          if (thread_id < static_cast<size_t>(world_size)) {
+            int target_rank = static_cast<int>(thread_id);
+            if (target_rank == rank) {
+              return;
+            }
+            // put_signal to target_rank's pad at slot [world_size * channel + rank]
+            try_put_signal_device(
+                pads[target_rank] + world_size * channel + rank, 10000000);
+            // wait_signal from target_rank on my pad at slot [world_size * channel + target_rank]
+            try_wait_signal_device(
+                pads[rank] + world_size * channel + target_rank, 10000000);
+          }
+        });
+    });
   }
 
 
@@ -296,6 +325,7 @@ class SymmMemory {
   std::vector<void*> remote_signal_ptrs_;
   void* local_data_ptr_ = nullptr;
   std::vector<void*> remote_data_ptrs_;
+  uint32_t** remote_signal_ptrs_dev_ = nullptr;  // device buffer holding signal pad pointers
 
 
  private:
