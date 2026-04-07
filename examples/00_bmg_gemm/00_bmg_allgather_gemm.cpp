@@ -155,10 +155,18 @@ struct ExampleRunner {
 		stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
 		stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_m, n, 1));
 		stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_m, n, 1));
-		shard_problem_ = ProblemShapeType{local_m, n, k, 1};
-		shard_stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(local_m, k, 1));
-		shard_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_m, n, 1));
-		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_m, n, 1));
+
+		// gemm_only uses full M; allgather uses local_m per shard
+		int gemm_m = (options.gemm_only != 0) ? options.m : local_m;
+		shard_problem_ = ProblemShapeType{gemm_m, n, k, 1};
+		shard_stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(gemm_m, k, 1));
+		shard_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(gemm_m, n, 1));
+		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(gemm_m, n, 1));
+
+		if (options.debug_log) {
+			std::printf("[rank %d] GEMM problem per call: M=%d N=%d K=%d (gemm_only=%d)\n",
+					rank, gemm_m, n, k, options.gemm_only);
+		}
 
 		log_init("Memory set A B C");
 		current_q_->memset(local_A, 0, static_cast<size_t>(local_m) * k * sizeof(ElementA)).wait();
@@ -230,19 +238,6 @@ struct ExampleRunner {
 		}
 		return gemm_op_.run(&queue);
 	}
-
-	static void enqueue_stream_bias(sycl::queue& q) {
-		q.submit([&](sycl::handler& h) {
-			h.single_task([=]() {
-				volatile int delay = 0;
-				for (int i = 0; i < 4096; ++i) {
-					delay += i;
-				}
-				(void)delay;
-			});
-		});
-	}
-
 	struct allgather_gemm {
 		ExampleRunner& runner;
 
@@ -342,22 +337,18 @@ struct ExampleRunner {
 			}
 
 			auto& current_q = *runner.current_q_;
-			auto& tmp_q = *runner.tmp_q_;
-
-			for (int shard = 0; shard < world_size; ++shard) {
-				auto& queue = (shard % 2 == 0) ? current_q : tmp_q;
-				auto st = runner.run_shard_gemm(
-						queue,
-						full_A + static_cast<size_t>(shard) * shard_a_elems,
+			auto st = runner.run_shard_gemm(
+						current_q,
+						full_A,
 						B,
-						final_C + static_cast<size_t>(shard) * shard_c_elems,
-						final_C + static_cast<size_t>(shard) * shard_c_elems,
+						final_C,
+						final_C,
 						options.alpha,
 						options.beta,
 						hw_info);
-				if (st != cutlass::Status::kSuccess) {
-					throw std::runtime_error("gemm_only shard GEMM submission failed.");
-				}
+						
+			if (st != cutlass::Status::kSuccess) {
+				throw std::runtime_error("gemm_only shard GEMM submission failed.");
 			}
 		}
 	};
@@ -434,10 +425,16 @@ struct ExampleRunner {
 		}
 		ElementB* B = sycl::malloc_device<ElementB>(b_elems, *current_q_);
 		ElementOutput* final_C = sycl::malloc_device<ElementOutput>(full_c_elems, *current_q_);
+		auto mb = [](size_t bytes) {
+			return static_cast<double>(bytes) / (1024.0 * 1024.0);
+		};
+		std::printf("[rank %d] Allocated: local_A=%.2f MiB, full_A=%.2f MiB, B=%.2f MiB, final_C=%.2f MiB\n",
+				rank,
+				mb(local_a_elems * sizeof(ElementA)),
+				mb(options.gemm_only != 0 ? full_a_elems * sizeof(ElementA) : 0),
+				mb(b_elems * sizeof(ElementB)),
+				mb(full_c_elems * sizeof(ElementOutput)));
 		if (local_A == nullptr || B == nullptr || final_C == nullptr || (options.gemm_only != 0 && full_A == nullptr)) {
-			auto mb = [](size_t bytes) {
-				return static_cast<double>(bytes) / (1024.0 * 1024.0);
-			};
 			throw std::runtime_error(
 				"Device allocation failed: local_A=" + std::to_string(mb(local_a_elems * sizeof(ElementA))) +
 				" MiB, full_A=" + std::to_string(mb(full_a_elems * sizeof(ElementA))) +
@@ -502,18 +499,17 @@ struct ExampleRunner {
 			auto dev_end_ns   = event_pair[1].get_profiling_info<sycl::info::event_profiling::command_start>();
 			total_device_ms += static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
 		}
-
-		current_q_->wait();
 		
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
 			double avg_device_ms = total_device_ms / options.iterations;
 			double tflops = (2.0 * options.m * options.n * options.k) * 1e-12;
+			const char* label = (options.gemm_only != 0) ? "GEMM only" : "Pipelined allgather+GEMM";
 			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
 			          << ", TP=" << world_size << std::endl;
-			printf("Pipelined allgather+GEMM (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_ms / 1000.0), avg_ms);
-			printf("Pipelined allgather+GEMM (device): [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_device_ms / 1000.0), avg_device_ms);
+			printf("%s (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", label, tflops / (avg_ms / 1000.0), avg_ms);
+			printf("%s (device): [%4.3f]TFlop/s  (%6.4f)ms\n", label, tflops / (avg_device_ms / 1000.0), avg_device_ms);
 		}
 
 		cleanup();
