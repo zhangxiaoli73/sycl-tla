@@ -89,10 +89,16 @@ struct ExampleRunner {
 	StrideB stride_B;
 	StrideC stride_C;
 	StrideD stride_D;
+	ProblemShapeType shard_problem_{};
+	StrideA shard_stride_A{};
+	StrideC shard_stride_C{};
+	StrideD shard_stride_D{};
+	int local_rows_ = 0;
 	std::unique_ptr<sycl::queue> current_q_;
 	std::unique_ptr<sycl::queue> tmp_q_;
 	std::unique_ptr<SymmMemory> symm_;
 	Gemm gemm_op_;
+	bool gemm_initialized_ = false;
 
 	size_t chunk_elements_ = 0;
 	size_t total_elements_ = 0;
@@ -169,12 +175,42 @@ struct ExampleRunner {
 			log_init("IPC buffers allocated");
 		}
 
+		// Pre-compute shard strides (same for every run_shard_gemm call)
+		local_rows_ = local_rows;
+		shard_problem_ = ProblemShapeType{local_rows, options.n, options.k, options.l};
+		shard_stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(local_rows, options.k, options.l));
+		shard_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_rows, options.n, options.l));
+		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_rows, options.n, options.l));
+
 		log_init("before block_A memset");
 		current_q_->memset(block_A, 0, static_cast<size_t>(options.m) * options.k * options.l * sizeof(ElementA)).wait();
 		log_init("before block_B memset");
 		current_q_->memset(block_B, 0, static_cast<size_t>(options.n) * options.k * options.l * sizeof(ElementB)).wait();
 		log_init("before block_C memset");
 		current_q_->memset(block_C, 0, static_cast<size_t>(options.m) * options.n * options.l * sizeof(ElementC)).wait();
+
+		// Initialize GEMM operator once with template args
+		if (!gemm_initialized_) {
+			typename Gemm::GemmKernel::Arguments template_args{
+				cutlass::gemm::GemmUniversalMode::kGemm,
+				shard_problem_,
+				{block_A, shard_stride_A, block_B, stride_B},
+				{{options.alpha, options.beta}, block_C, shard_stride_C, block_C, shard_stride_D},
+				hw_info};
+
+			log_init("before can_implement");
+			auto st = gemm_op_.can_implement(template_args);
+			if (st != cutlass::Status::kSuccess) {
+				throw std::runtime_error("GEMM cannot implement shard args.");
+			}
+			log_init("before gemm initialize");
+			st = gemm_op_.initialize(template_args, nullptr, current_q_.get());
+			if (st != cutlass::Status::kSuccess) {
+				throw std::runtime_error("GEMM initialize failed.");
+			}
+			gemm_initialized_ = true;
+			log_init("GEMM operator initialized");
+		}
 		log_init("initialize end");
 	}
 
@@ -189,27 +225,21 @@ struct ExampleRunner {
 			int local_rows,
 			ElementOutput* dst_ptr) {
 
-		ProblemShapeType subproblem{local_rows, options.n, options.k, options.l};
-
-		auto sub_stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(local_rows, options.k, options.l));
-		auto sub_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_rows, options.n, options.l));
-		auto sub_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_rows, options.n, options.l));
-
 		size_t a_off = static_cast<size_t>(producer_rank) * local_rows * options.k * options.l;
 		size_t c_off = static_cast<size_t>(producer_rank) * local_rows * options.n * options.l;
 
 		typename Gemm::GemmKernel::Arguments args{
 			cutlass::gemm::GemmUniversalMode::kGemm,
-			subproblem,
-			{block_A + a_off, sub_stride_A, block_B, stride_B},
-			{{options.alpha, options.beta}, block_C + c_off, sub_stride_C, dst_ptr, sub_stride_D},
+			shard_problem_,
+			{block_A + a_off, shard_stride_A, block_B, stride_B},
+			{{options.alpha, options.beta}, block_C + c_off, shard_stride_C, dst_ptr, shard_stride_D},
 			hw_info};
 
-		if (Gemm::get_workspace_size(args) != 0) return cutlass::Status::kErrorInternal;
+		if (!gemm_initialized_) {
+			return cutlass::Status::kErrorInternal;
+		}
 
-		auto st = gemm_op_.can_implement(args);
-		if (st != cutlass::Status::kSuccess) return st;
-		st = gemm_op_.initialize(args, nullptr, &queue);
+		auto st = gemm_op_.update(args, nullptr);
 		if (st != cutlass::Status::kSuccess) return st;
 		return gemm_op_.run(&queue);
 	}
@@ -229,7 +259,7 @@ struct ExampleRunner {
 	struct reduce_scatter {
 		ExampleRunner& runner;
 
-		void operator()(
+		sycl::event operator()(
 				sycl::queue& q,
 				ElementA* block_A,
 				ElementB* block_B,
@@ -278,7 +308,7 @@ struct ExampleRunner {
 				throw std::runtime_error("run_shard_gemm (local shard) failed.");
 
 			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
-			symm.barrier(0, current_q);
+			auto barrier_event = symm.barrier(0, current_q);
 
 			// Phase 3: local reduction for this rank's shard.
 			{
@@ -296,10 +326,11 @@ struct ExampleRunner {
 					});
 				});
 			}
+			return barrier_event;
 		}
 	};
 
-	void run_iteration(
+	sycl::event run_iteration(
 			sycl::queue& q,
 			ElementA* block_A,
 			ElementB* block_B,
@@ -311,7 +342,7 @@ struct ExampleRunner {
 			int world_size) {
 
 		reduce_scatter op{*this};
-		op(q, block_A, block_B, block_C, symm, options, hw_info, rank, world_size);
+		return op(q, block_A, block_B, block_C, symm, options, hw_info, rank, world_size);
 	}
 
 	cutlass::Status run(
@@ -388,10 +419,14 @@ struct ExampleRunner {
 		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
 		// benchmark
-		auto ev_before = current_q_->ext_oneapi_submit_barrier();
+		sycl::event ev_before;
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+			if (iter == 1) {
+				ev_before = run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+			} else {
+				run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+			}
 		}
 		auto benchmark_stop = std::chrono::high_resolution_clock::now();
 		auto ev_after = current_q_->ext_oneapi_submit_barrier();
@@ -406,7 +441,7 @@ struct ExampleRunner {
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
-			double avg_device_ms = total_device_ms / options.iterations;
+			double avg_device_ms = total_device_ms / (options.iterations - 2);
 			int local_rows = options.m / world_size;
 			double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
 			std::cout << "[" << rank << "] Problem Size: " << options.m << 'x' << options.n << 'x' << options.k

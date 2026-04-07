@@ -278,11 +278,11 @@ class SymmMemory {
   // Equivalent semantics to XPUSymmetricMemory::barrier(channel):
   // - publish a ticket to peers' signal pads
   // - wait until every peer publishes the same ticket to this rank
-  void barrier(int channel, size_t timeout_ms = 0) {
-    barrier(channel, init_q_, timeout_ms);
+  sycl::event barrier(int channel, size_t timeout_ms = 0) {
+    return barrier(channel, init_q_, timeout_ms);
   }
 
-  void barrier(int channel, sycl::queue& queue, size_t timeout_ms = 0) {
+  sycl::event barrier(int channel, sycl::queue& queue, size_t timeout_ms = 0) {
     channel = 0; // todo: channel =0 as temp solution
     (void)timeout_ms;
     int rank = rank_;
@@ -293,7 +293,7 @@ class SymmMemory {
     // signal_pads layout: signal_pads[target_rank][world_size * channel + src_rank]
     // put_signal: wait until slot==0, then write 1 (release)
     // wait_signal: wait until slot==1, then write 0 (acquire)
-    queue.submit([&](sycl::handler& h) {
+    return queue.submit([&](sycl::handler& h) {
       h.parallel_for(sycl::nd_range<1>(std::max(32, world_size), std::max(32, world_size)),
         [=](sycl::nd_item<1> item) {
           auto thread_id = item.get_local_id(0);
@@ -304,10 +304,10 @@ class SymmMemory {
             }
             // put_signal to target_rank's pad at slot [world_size * channel + rank]
             try_put_signal_device(
-                pads[target_rank] + world_size * channel + rank, 10000000);
+                pads[target_rank] + world_size * channel + rank, 0);
             // wait_signal from target_rank on my pad at slot [world_size * channel + target_rank]
             try_wait_signal_device(
-                pads[rank] + world_size * channel + target_rank, 10000000);
+                pads[rank] + world_size * channel + target_rank, 0);
           }
         });
     });

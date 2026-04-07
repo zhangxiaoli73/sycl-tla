@@ -241,7 +241,7 @@ struct ExampleRunner {
 	struct allgather_gemm {
 		ExampleRunner& runner;
 
-		void operator()(
+		sycl::event operator()(
 				sycl::queue& q,
 				ElementA* local_A,
 				ElementB* B,
@@ -312,14 +312,15 @@ struct ExampleRunner {
 				}
 			}
 			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
-			symm.barrier(0, current_q);
+			auto event = symm.barrier(0, current_q);
+			return event;
 		}
 	};
 
 	struct gemm_only {
 		ExampleRunner& runner;
 
-		void operator()(
+		sycl::event operator()(
 				sycl::queue& q,
 				ElementA* full_A,
 				ElementB* B,
@@ -351,10 +352,11 @@ struct ExampleRunner {
 			if (st != cutlass::Status::kSuccess) {
 				throw std::runtime_error("gemm_only shard GEMM submission failed.");
 			}
+			return current_q.ext_oneapi_submit_barrier();
 		}
 	};
 
-	void run_iteration(
+	sycl::event run_iteration(
 			sycl::queue& q,
 			ElementA* local_A,
 			ElementB* B,
@@ -368,10 +370,10 @@ struct ExampleRunner {
 			int world_size) {
 
 		allgather_gemm op{*this};
-		op(q, local_A, B, final_C, symm, options, hw_info, ctx, dev, rank, world_size);
+		return op(q, local_A, B, final_C, symm, options, hw_info, ctx, dev, rank, world_size);
 	}
 
-	void run_iteration_gemm_only(
+	sycl::event run_iteration_gemm_only(
 			sycl::queue& q,
 			ElementA* full_A,
 			ElementB* B,
@@ -384,7 +386,7 @@ struct ExampleRunner {
 			int world_size) {
 
 		gemm_only op{*this};
-		op(q, full_A, B, final_C, options, hw_info, ctx, dev, rank, world_size);
+		return op(q, full_A, B, final_C, options, hw_info, ctx, dev, rank, world_size);
 	}
 
 	cutlass::Status run(
@@ -475,14 +477,23 @@ struct ExampleRunner {
 		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
 		// benchmark
-		auto ev_before = current_q_->ext_oneapi_submit_barrier();
+		sycl::event ev_before;
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			if (options.gemm_only != 0) {
-				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
+			if (iter == 1) {
+				if (options.gemm_only != 0) {
+					ev_before = run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
+				} else {
+					ev_before = run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+				}
 			} else {
-				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+				if (options.gemm_only != 0) {
+					run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
+				} else {
+					run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
+				}
 			}
+			
 		}
 		auto benchmark_stop = std::chrono::high_resolution_clock::now();
 		auto ev_after = current_q_->ext_oneapi_submit_barrier();
@@ -497,7 +508,7 @@ struct ExampleRunner {
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
-			double avg_device_ms = total_device_ms / options.iterations;
+			double avg_device_ms = total_device_ms / (options.iterations - 2);
 			double tflops = (2.0 * options.m * options.n * options.k) * 1e-12;
 			const char* label = (options.gemm_only != 0) ? "GEMM only" : "Pipelined allgather+GEMM";
 			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
