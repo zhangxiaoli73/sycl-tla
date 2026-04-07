@@ -129,7 +129,7 @@ struct ExampleRunner {
 			current_q_ = std::make_unique<sycl::queue>(
 					ctx,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}});
+					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
 			log_init("current_q created");
 		}
 
@@ -147,7 +147,7 @@ struct ExampleRunner {
 			tmp_q_ = std::make_unique<sycl::queue>(
 					ctx,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}});
+					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
 			log_init("tmp_q created");
 		}
 
@@ -165,7 +165,7 @@ struct ExampleRunner {
 		log_init("after local_A memset");
 		log_init("before B memset");
 		current_q_->memset(B, 0, static_cast<size_t>(n) * k * sizeof(ElementB)).wait();
-		log_init("after B memset");
+		log_init("after B memset"); 
 		log_init("input buffers initialized");
 		if (final_C == nullptr) {
 			throw std::runtime_error("final_C is null before q.fill; device allocation likely failed.");
@@ -278,64 +278,47 @@ struct ExampleRunner {
 			auto& current_q = *runner.current_q_;
 			auto& tmp_q = *runner.tmp_q_;
 
-			using time_point = std::chrono::high_resolution_clock::time_point;
-			// 0: loop top, 1: after rank/channel calc, 2: after remote_src load, 3: after local_dst calc, 4: before memcpy, 5: after memcpy, 6: after gemm
-			std::vector<std::array<time_point, 7>> ts(world_size - 1);
+			// copy local to symm memory for allgather
+			current_q.memcpy(gathered_A + static_cast<size_t>(rank) * shard_a_elems, local_A, shard_a_bytes);
+			symm.barrier(0, current_q);
 
-			auto loop_t0 = std::chrono::high_resolution_clock::now();
-			
+			// do local GEMM first without waiting for allgather to complete, to achieve better overlap between communication and computation
+			auto local_st = runner.run_shard_gemm(
+					current_q,
+					gathered_A + static_cast<size_t>(rank) * shard_a_elems,
+					B,
+					final_C + static_cast<size_t>(rank) * shard_c_elems,
+					final_C + static_cast<size_t>(rank) * shard_c_elems,
+					options.alpha,
+					options.beta,
+					hw_info);
+			if (local_st != cutlass::Status::kSuccess) {
+				throw std::runtime_error("allgather_gemm local shard GEMM submission failed.");
+			}
+
 			for (int step = 1; step < world_size; ++step) {
-				ts[step - 1][0] = std::chrono::high_resolution_clock::now();
 				int remote_rank = (rank + step) % world_size;
-				int channel = 0; //step % 2;
+				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
-				ts[step - 1][1] = std::chrono::high_resolution_clock::now();
 
 				ElementA* remote_src = remote_data_ptrs[remote_rank];
-				ts[step - 1][2] = std::chrono::high_resolution_clock::now();
 				ElementA* local_dst = gathered_A + static_cast<size_t>(remote_rank) * shard_a_elems;
-				ts[step - 1][3] = std::chrono::high_resolution_clock::now();
-
-				// symm.barrier(channel, queue);
-				ts[step - 1][4] = std::chrono::high_resolution_clock::now();
 				queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from remote to local peer buffer
-				ts[step - 1][5] = std::chrono::high_resolution_clock::now();
 
 				auto st = runner.run_shard_gemm(
 						queue,
-						local_A,
+						local_dst,
 						B,
 						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
 						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
 						options.alpha,
 						options.beta,
 						hw_info);
-				ts[step - 1][6] = std::chrono::high_resolution_clock::now();
-				
-				// symm.barrier(channel, queue);
-			}
-
-			auto loop_t1 = std::chrono::high_resolution_clock::now();
-			double loop_us = std::chrono::duration<double, std::micro>(loop_t1 - loop_t0).count();
-			if (options.debug_log) {
-				for (int step = 1; step < world_size; ++step) {
-					double rank_calc_us  = std::chrono::duration<double, std::micro>(ts[step - 1][1] - ts[step - 1][0]).count();
-					double remote_src_us = std::chrono::duration<double, std::micro>(ts[step - 1][2] - ts[step - 1][1]).count();
-					double local_dst_us  = std::chrono::duration<double, std::micro>(ts[step - 1][3] - ts[step - 1][2]).count();
-					double barrier_us    = std::chrono::duration<double, std::micro>(ts[step - 1][4] - ts[step - 1][3]).count();
-					double copy_us       = std::chrono::duration<double, std::micro>(ts[step - 1][5] - ts[step - 1][4]).count();
-					double gemm_us       = std::chrono::duration<double, std::micro>(ts[step - 1][6] - ts[step - 1][5]).count();
-					std::cout << "[rank " << rank << "] step=" << step
-								<< " rank_calc: " << rank_calc_us << " us"
-								<< ", remote_src: " << remote_src_us << " us"
-								<< ", local_dst: " << local_dst_us << " us"
-								<< ", barrier: " << barrier_us << " us"
-								<< ", memcpy API: " << copy_us << " us"
-								<< ", run_shard_gemm API: " << gemm_us << " us" << std::endl;
+				if (st != cutlass::Status::kSuccess) {
+					throw std::runtime_error("allgather_gemm shard GEMM submission failed.");
 				}
 			}
-			
-			std::cout << "[rank " << rank << "] allgather_gemm loop total: " << loop_us << " us" << std::endl;
+			symm.barrier(0, current_q);
 		}
 	};
 
@@ -360,16 +343,9 @@ struct ExampleRunner {
 				throw std::runtime_error("gemm_only input pointer is null.");
 			}
 
-			auto log = [&](char const* msg) {
-				if (options.debug_log) {
-					std::cout << "[rank " << rank << "] " << msg << std::endl;
-				}
-			};
-
 			auto& current_q = *runner.current_q_;
 			auto& tmp_q = *runner.tmp_q_;
 
-			log("gemm_only iteration begin");
 			for (int shard = 0; shard < world_size; ++shard) {
 				auto& queue = (shard % 2 == 0) ? current_q : tmp_q;
 				auto st = runner.run_shard_gemm(
@@ -385,7 +361,6 @@ struct ExampleRunner {
 					throw std::runtime_error("gemm_only shard GEMM submission failed.");
 				}
 			}
-			log("gemm_only iteration end");
 		}
 	};
 
@@ -403,11 +378,7 @@ struct ExampleRunner {
 			int world_size) {
 
 		allgather_gemm op{*this};
-		auto ri_t0 = std::chrono::high_resolution_clock::now();
 		op(q, local_A, B, final_C, symm, options, hw_info, ctx, dev, rank, world_size);
-		auto ri_t1 = std::chrono::high_resolution_clock::now();
-		double ri_us = std::chrono::duration<double, std::micro>(ri_t1 - ri_t0).count();
-		std::cout << "[rank " << rank << "] run_iteration op() total: " << ri_us << " us" << std::endl;
 	}
 
 	void run_iteration_gemm_only(
@@ -423,9 +394,6 @@ struct ExampleRunner {
 			int world_size) {
 
 		gemm_only op{*this};
-		if (options.debug_log) {
-			std::cout << "[rank " << rank << "] entering gemm_only" << std::endl;
-		}
 		op(q, full_A, B, final_C, options, hw_info, ctx, dev, rank, world_size);
 	}
 
@@ -457,7 +425,7 @@ struct ExampleRunner {
 			current_q_ = std::make_unique<sycl::queue>(
 					queue_context,
 					device,
-					sycl::property_list{sycl::property::queue::in_order{}});
+					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
 		}
 
 		sycl::context ctx = current_q_->get_context();
@@ -497,9 +465,8 @@ struct ExampleRunner {
 
 		// warmup
 		constexpr int kWarmupIters = 10;
-		if (options.debug_log && rank == 0) {
-			std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
-		}
+		
+		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
 			if (options.gemm_only != 0) {
 				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
@@ -507,36 +474,49 @@ struct ExampleRunner {
 				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
 			}
 		}
-		if (options.debug_log && rank == 0) {
-			std::cout << "[rank " << rank << "] warmup done" << std::endl;
-		}
 
 		current_q_->wait();
 		MPI_Barrier(MPI_COMM_WORLD); // ensure all ranks have finished warmup before starting benchmark iterations
+		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
+		std::vector<std::array<sycl::event, 2>> benchmark_events;
+		benchmark_events.reserve(options.iterations);
 		// benchmark
-		double total_ms = 0.0;
+		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			auto start = std::chrono::high_resolution_clock::now();
+			auto ev_before = current_q_->ext_oneapi_submit_barrier();
 			if (options.gemm_only != 0) {
 				run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
 			} else {
 				run_iteration(*current_q_, local_A, B, final_C, *symm_, options, hw_info, ctx, device, rank, world_size);
 			}
-			auto stop = std::chrono::high_resolution_clock::now();
-			double local_elapsed_ms = std::chrono::duration<double, std::milli>(stop - start).count();
-			std::cout << "[rank " << rank << "] iteration " << iter << " elapsed time: " << local_elapsed_ms << " ms" << std::endl;
-			MPI_Barrier(MPI_COMM_WORLD);
-			current_q_->wait();
-			total_ms += local_elapsed_ms;
+			auto ev_after = current_q_->ext_oneapi_submit_barrier();
+			benchmark_events.push_back({ev_before, ev_after});
+
 		}
+		auto benchmark_stop = std::chrono::high_resolution_clock::now();
+        current_q_->wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		double total_ms = std::chrono::duration<double, std::milli>(benchmark_stop - benchmark_start).count();
+		double total_device_ms = 0.0;
+		for (auto const& event_pair : benchmark_events) {
+			auto dev_start_ns = event_pair[0].get_profiling_info<sycl::info::event_profiling::command_end>();
+			auto dev_end_ns   = event_pair[1].get_profiling_info<sycl::info::event_profiling::command_start>();
+			total_device_ms += static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
+		}
+
+		current_q_->wait();
+		
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
+			double avg_device_ms = total_device_ms / options.iterations;
 			double tflops = (2.0 * options.m * options.n * options.k) * 1e-12;
 			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
 			          << ", TP=" << world_size << std::endl;
-			printf("Pipelined allgather+GEMM: [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_ms / 1000.0), avg_ms);
+			printf("Pipelined allgather+GEMM (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_ms / 1000.0), avg_ms);
+			printf("Pipelined allgather+GEMM (device): [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / (avg_device_ms / 1000.0), avg_device_ms);
 		}
 
 		cleanup();
