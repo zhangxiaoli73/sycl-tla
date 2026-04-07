@@ -47,8 +47,8 @@ struct Options {
 			help = true;
 			return;
 		}
-		cmd.get_cmd_line_argument("m", m, 5120);
-		cmd.get_cmd_line_argument("n", n, 4096);
+		cmd.get_cmd_line_argument("m", m, 8192);
+		cmd.get_cmd_line_argument("n", n, 1536);
 		cmd.get_cmd_line_argument("k", k, 4096);
 		cmd.get_cmd_line_argument("l", l, 1);
 		cmd.get_cmd_line_argument("alpha", alpha, 1.0f);
@@ -160,25 +160,18 @@ struct ExampleRunner {
 		shard_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_m, n, 1));
 		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_m, n, 1));
 
-		log_init("before local_A memset");
+		log_init("Memory set A B C");
 		current_q_->memset(local_A, 0, static_cast<size_t>(local_m) * k * sizeof(ElementA)).wait();
-		log_init("after local_A memset");
-		log_init("before B memset");
 		current_q_->memset(B, 0, static_cast<size_t>(n) * k * sizeof(ElementB)).wait();
-		log_init("after B memset"); 
-		log_init("input buffers initialized");
-		if (final_C == nullptr) {
-			throw std::runtime_error("final_C is null before q.fill; device allocation likely failed.");
-		}
-		log_init("before final_C fill");
 		current_q_->memset(final_C, 0, static_cast<size_t>(options.m) * n * sizeof(ElementOutput)).wait();
-		log_init("after final_C fill");
+		log_init("Memory set A B C finished");
 
-		ElementA* gathered_A = reinterpret_cast<ElementA*>(symm_->local_data_ptr());
+		ElementA* gathered_A = reinterpret_cast<ElementA*>(symm_->local_data_ptr_);
 		if (gathered_A == nullptr) {
 			throw std::runtime_error("symm local_data_ptr is null.");
 		}
 
+        // todo: gemm template stable ptr?
 		typename Gemm::GemmKernel::Arguments template_args{
 				cutlass::gemm::GemmUniversalMode::kGemm,
 				shard_problem_,
@@ -203,7 +196,7 @@ struct ExampleRunner {
 				std::cout << "[rank " << rank << "] GEMM operator initialized" << std::endl;
 			}
 		}
-		log_init("initialize end");
+		log_init("All initialize end");
 	}
 
 	cutlass::Status run_shard_gemm(
@@ -269,9 +262,8 @@ struct ExampleRunner {
 			size_t shard_a_elems = static_cast<size_t>(local_m) * options.k;
 			size_t shard_c_elems = static_cast<size_t>(local_m) * options.n;
 			size_t shard_a_bytes = shard_a_elems * sizeof(ElementA);
-			ElementA* gathered_A = reinterpret_cast<ElementA*>(symm.local_data_ptr());
-			auto remote_data_ptrs = reinterpret_cast<ElementA**>(symm.remote_data_ptrs());
-			if (gathered_A == nullptr || remote_data_ptrs == nullptr) {
+			ElementA* gathered_A = reinterpret_cast<ElementA*>(symm.local_data_ptr_);
+			if (gathered_A == nullptr) {
 				throw std::runtime_error("SymmMemory IPC pointers are null.");
 			}
 
@@ -301,8 +293,13 @@ struct ExampleRunner {
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
 
-				ElementA* remote_src = remote_data_ptrs[remote_rank];
+				ElementA* remote_src = reinterpret_cast<ElementA*>(symm.get_data_buffer(remote_rank));
 				ElementA* local_dst = gathered_A + static_cast<size_t>(remote_rank) * shard_a_elems;
+
+				if (remote_src == nullptr || local_dst == nullptr) {
+				    throw std::runtime_error("SymmMemory remote pointers are null.");
+			    }
+
 				queue.memcpy(local_dst, remote_src, shard_a_bytes); // copy from remote to local peer buffer
 
 				auto st = runner.run_shard_gemm(
@@ -459,9 +456,8 @@ struct ExampleRunner {
 		if (options.gemm_only != 0) {
 			current_q_->memset(full_A, 0, full_a_elems * sizeof(ElementA)).wait();
 		}
-		if (options.debug_log) {
-			std::cout << "[rank " << rank << "] initialization complete" << std::endl;
-		}
+		MPI_Barrier(MPI_COMM_WORLD);
+		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 
 		// warmup
 		constexpr int kWarmupIters = 10;

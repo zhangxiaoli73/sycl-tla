@@ -134,6 +134,25 @@ target_link_libraries(
   $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
 )
 
+cutlass_example_add_executable(
+  00_bmg_symm_test
+  symm_test.cpp
+)
+
+target_include_directories(
+  00_bmg_symm_test
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
+target_link_libraries(
+  00_bmg_symm_test
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)
+
 set(TEST_SMALL_SHAPE_PADDABLE --m=1 --n=1 --k=2 --l=2)
 cutlass_example_add_executable(
   00_bmg_gemm_padded
