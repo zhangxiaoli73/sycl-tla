@@ -32,6 +32,7 @@ struct Options {
 	int l = 1;
 	int iterations = 20;
 	int debug_log = 1;
+	int verify = 0;
 	float alpha = 1.0f;
 	float beta = 0.0f;
 
@@ -53,6 +54,7 @@ struct Options {
 		cmd.get_cmd_line_argument("beta", beta, 0.0f);
 		cmd.get_cmd_line_argument("iterations", iterations, 20);
 		cmd.get_cmd_line_argument("debug_log", debug_log, 1);
+		cmd.get_cmd_line_argument("verify", verify, 0);
 	}
 
 	std::ostream& print_usage(std::ostream& out) const {
@@ -62,7 +64,8 @@ struct Options {
 			<< "  --k=<int>         K extent\n"
 			<< "  --l=<int>         batch count\n"
 			<< "  --iterations=<int>\n"
-			<< "  --debug_log=<int> 0/1 progress logs (default 1)\n\n";
+			<< "  --debug_log=<int> 0/1 progress logs (default 1)\n"
+			<< "  --verify=<int>    0/1 run accuracy verification (default 0)\n\n";
 		return out;
 	}
 };
@@ -102,10 +105,6 @@ struct ExampleRunner {
 
 	size_t chunk_elements_ = 0;
 	size_t total_elements_ = 0;
-	ElementOutput* local_p2p_ = nullptr;
-	ElementOutput* stacked_partials_ = nullptr;
-	std::vector<void*> remote_p2p_ptrs_;
-	std::vector<void*> opened_p2p_bases_;
 
 	void initialize(
 			ElementA* block_A,
@@ -147,7 +146,9 @@ struct ExampleRunner {
 
 		if (!symm_) {
 			log_init("creating SymmMemory");
-			symm_ = std::make_unique<SymmMemory>(local_rows, options.n, options.k, rank, world_size, *current_q_, 8);
+			// Pass global M so symm buffer = world_size * M * N * 2 bytes,
+			// large enough for world_size slots of (local_rows * N) floats.
+			symm_ = std::make_unique<SymmMemory>(options.m, options.n, options.k, rank, world_size, *current_q_, 8);
 			log_init("SymmMemory created");
 		}
 
@@ -163,17 +164,6 @@ struct ExampleRunner {
 
 		chunk_elements_ = static_cast<size_t>(local_rows) * options.n * options.l;
 		total_elements_ = static_cast<size_t>(options.m) * options.n * options.l;
-
-		if (!local_p2p_) {
-			log_init("allocating IPC buffers");
-			size_t slots = static_cast<size_t>(world_size - 1);
-			local_p2p_ = sycl::malloc_device<ElementOutput>(slots * chunk_elements_, *current_q_);
-			stacked_partials_ = sycl::malloc_device<ElementOutput>(total_elements_, *current_q_);
-			current_q_->memset(local_p2p_, 0, slots * chunk_elements_ * sizeof(ElementOutput)).wait();
-			current_q_->memset(stacked_partials_, 0, total_elements_ * sizeof(ElementOutput)).wait();
-			remote_p2p_ptrs_ = exchange_ipc_ptrs(local_p2p_, rank, world_size, *current_q_, opened_p2p_bases_);
-			log_init("IPC buffers allocated");
-		}
 
 		// Pre-compute shard strides (same for every run_shard_gemm call)
 		local_rows_ = local_rows;
@@ -216,23 +206,19 @@ struct ExampleRunner {
 
 	cutlass::Status run_shard_gemm(
 			sycl::queue& queue,
-			ElementA* block_A,
-			ElementB* block_B,
-			ElementC* block_C,
-			Options const& options,
-			cutlass::KernelHardwareInfo const& hw_info,
-			int producer_rank,
-			int local_rows,
-			ElementOutput* dst_ptr) {
-
-		size_t a_off = static_cast<size_t>(producer_rank) * local_rows * options.k * options.l;
-		size_t c_off = static_cast<size_t>(producer_rank) * local_rows * options.n * options.l;
+			ElementA* a_ptr,
+			ElementB* b_ptr,
+			ElementC* c_ptr,
+			ElementOutput* d_ptr,
+			ElementCompute alpha,
+			ElementCompute beta,
+			cutlass::KernelHardwareInfo const& hw_info) {
 
 		typename Gemm::GemmKernel::Arguments args{
 			cutlass::gemm::GemmUniversalMode::kGemm,
 			shard_problem_,
-			{block_A + a_off, shard_stride_A, block_B, stride_B},
-			{{options.alpha, options.beta}, block_C + c_off, shard_stride_C, dst_ptr, shard_stride_D},
+			{a_ptr, shard_stride_A, b_ptr, stride_B},
+			{{alpha, beta}, c_ptr, shard_stride_C, d_ptr, shard_stride_D},
 			hw_info};
 
 		if (!gemm_initialized_) {
@@ -242,18 +228,6 @@ struct ExampleRunner {
 		auto st = gemm_op_.update(args, nullptr);
 		if (st != cutlass::Status::kSuccess) return st;
 		return gemm_op_.run(&queue);
-	}
-
-	static void enqueue_stream_bias(sycl::queue& q) {
-		q.submit([&](sycl::handler& h) {
-			h.single_task([=]() {
-				volatile int delay = 0;
-				for (int i = 0; i < 4096; ++i) {
-					delay += i;
-				}
-				(void)delay;
-			});
-		});
 	}
 
 	struct reduce_scatter {
@@ -271,20 +245,19 @@ struct ExampleRunner {
 				int world_size) const {
 			int local_rows = options.m / world_size;
 			size_t shard_c_elems = static_cast<size_t>(local_rows) * options.n * options.l;
+			size_t shard_a_elems = static_cast<size_t>(local_rows) * options.k * options.l;
 			size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
 			size_t shard_bytes = shard_c_elems * sizeof(ElementOutput);
 
 			ElementOutput* local_p2p_ = reinterpret_cast<ElementOutput*>(symm.local_data_ptr_);
 			auto& remote_p2p_ptrs_ = symm.remote_data_ptrs_;
 
-			if (runner.local_p2p_ == nullptr || runner.remote_p2p_ptrs_.empty()) {
+			if (local_p2p_ == nullptr || remote_p2p_ptrs_.empty()) {
 				throw std::runtime_error("IPC pointers are null.");
 			}
 
 			auto& current_q = *runner.current_q_;
 			auto& tmp_q = *runner.tmp_q_;
-
-			symm.barrier(0, current_q);
 
 			// Phase 1+2: run local GEMM for each shard and push to destination peer.
 			for (int step = 1; step < world_size; ++step) {
@@ -293,40 +266,57 @@ struct ExampleRunner {
 				auto& queue = (channel == 0) ? current_q : tmp_q;
 				// step1: tmp_q, step2, current_q, step3: tmp_q
 
-				ElementOutput* local_shard_out = local_p2p_ + static_cast<size_t>(step - 1) * shard_c_elems;
-				auto st = runner.run_shard_gemm(queue, block_A, block_B, block_C,
-				                              options, hw_info, dst_rank, local_rows, local_shard_out);
+				ElementOutput* local_shard_out = local_p2p_ + dst_rank * shard_c_elems;
+				auto st = runner.run_shard_gemm(queue,
+					block_A + static_cast<size_t>(dst_rank) * shard_a_elems,
+					block_B,
+					local_shard_out,
+					local_shard_out,
+					options.alpha, options.beta, hw_info);
 				if (st != cutlass::Status::kSuccess)
 					throw std::runtime_error("run_shard_gemm (remote shard) failed.");
-				ElementOutput* remote_dst = reinterpret_cast<ElementOutput*>(remote_p2p_ptrs_[dst_rank]) + static_cast<size_t>(step - 1) * shard_c_elems;
+				ElementOutput* remote_dst = reinterpret_cast<ElementOutput*>(remote_p2p_ptrs_[dst_rank]) + rank * shard_c_elems;
 				queue.memcpy(remote_dst, local_shard_out, shard_bytes);
 			}
 
-			auto st_local = runner.run_shard_gemm(current_q, block_A, block_B, block_C,
-			                                    options, hw_info, rank, local_rows, local_p2p_ + local_off);
+			auto st_local = runner.run_shard_gemm(current_q,
+				block_A + static_cast<size_t>(rank) * shard_a_elems,
+				block_B,
+				local_p2p_ + local_off,
+				local_p2p_ + local_off,
+				options.alpha, options.beta, hw_info);
 			if (st_local != cutlass::Status::kSuccess)
 				throw std::runtime_error("run_shard_gemm (local shard) failed.");
 
 			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
-			auto barrier_event = symm.barrier(0, current_q);
+			symm.barrier(0, current_q);
 
-			// Phase 3: local reduction for this rank's shard.
+			// Phase 3: local reduction for this rank's shard, output to block_C.
+			// After barrier, slot[r] on this rank's buffer contains
+			// the partial from rank r (for all r in 0..world_size-1).
 			{
-				ElementOutput* local_partial = local_p2p_ + local_off;
 				ElementOutput* recv_slots = local_p2p_;
+				ElementC* out = block_C + local_off;
 				int ws = world_size;
 				size_t ce = shard_c_elems;
-				current_q.submit([&](sycl::handler& h) {
-					h.parallel_for(sycl::range<1>(shard_c_elems), [=](sycl::id<1> idx) {
-						ElementOutput acc = local_partial[idx[0]];
-						for (int step = 1; step < ws; ++step) {
-							acc += recv_slots[static_cast<size_t>(step - 1) * ce + idx[0]];
-						}
-						local_partial[idx[0]] = acc;
-					});
+				constexpr size_t wg_size = 256;
+				size_t global_size = ((shard_c_elems + wg_size - 1) / wg_size) * wg_size;
+				size_t n_elems = shard_c_elems;
+				return current_q.submit([&](sycl::handler& h) {
+					h.parallel_for<class local_reduction_kernel>(
+						sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(wg_size)),
+						[=](sycl::nd_item<1> item) {
+							size_t i = item.get_global_id(0);
+							if (i >= n_elems) return;
+							ElementOutput acc = 0;
+							#pragma unroll
+							for (int r = 0; r < ws; ++r) {
+								acc += recv_slots[static_cast<size_t>(r) * ce + i];
+							}
+							out[i] = acc;
+						});
 				});
 			}
-			return barrier_event;
 		}
 	};
 
@@ -343,6 +333,102 @@ struct ExampleRunner {
 
 		reduce_scatter op{*this};
 		return op(q, block_A, block_B, block_C, symm, options, hw_info, rank, world_size);
+	}
+
+	bool verify(
+			ElementA* block_A,
+			ElementB* block_B,
+			ElementC* block_C,
+			Options const& options,
+			cutlass::KernelHardwareInfo const& hw_info,
+			int rank,
+			int world_size) {
+		auto& q = *current_q_;
+		int local_rows = options.m / world_size;
+		size_t shard_c_elems = static_cast<size_t>(local_rows) * options.n * options.l;
+		size_t shard_a_elems = static_cast<size_t>(local_rows) * options.k * options.l;
+		size_t full_c_elems = static_cast<size_t>(options.m) * options.n * options.l;
+		size_t a_elems = static_cast<size_t>(options.m) * options.k * options.l;
+		size_t b_elems = static_cast<size_t>(options.n) * options.k * options.l;
+
+		// Fill A and B with non-zero values for meaningful verification
+		float a_val = 1.0f;
+		float b_val = 1.0f;
+		q.submit([&](sycl::handler& h) {
+			h.parallel_for(sycl::range<1>(a_elems), [=](sycl::id<1> i) {
+				block_A[i] = static_cast<ElementA>(a_val);
+			});
+		});
+		q.submit([&](sycl::handler& h) {
+			h.parallel_for(sycl::range<1>(b_elems), [=](sycl::id<1> i) {
+				block_B[i] = static_cast<ElementB>(b_val);
+			});
+		});
+		q.wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		// Step 1: Full GEMM — run world_size shard GEMMs to produce D_full[M x N]
+		ElementOutput* d_full = sycl::malloc_device<ElementOutput>(full_c_elems, q);
+		q.memset(d_full, 0, full_c_elems * sizeof(ElementOutput)).wait();
+
+		for (int s = 0; s < world_size; ++s) {
+			auto st = run_shard_gemm(q,
+				block_A + static_cast<size_t>(s) * shard_a_elems,
+				block_B,
+				d_full + static_cast<size_t>(s) * shard_c_elems,
+				d_full + static_cast<size_t>(s) * shard_c_elems,
+				options.alpha, options.beta, hw_info);
+			if (st != cutlass::Status::kSuccess) {
+				printf("[rank %d] verify: full GEMM shard %d failed\n", rank, s);
+				sycl::free(d_full, q);
+				return false;
+			}
+		}
+		q.wait();
+
+		// Step 2: Copy full GEMM result to host
+		std::vector<ElementOutput> host_full(full_c_elems);
+		q.memcpy(host_full.data(), d_full, full_c_elems * sizeof(ElementOutput)).wait();
+		sycl::free(d_full, q);
+
+		// Step 3: MPI_Reduce_scatter to get reference for this rank's shard
+		std::vector<ElementOutput> host_ref(shard_c_elems);
+		std::vector<int> recvcounts(world_size, static_cast<int>(shard_c_elems));
+		MPI_Reduce_scatter(host_full.data(), host_ref.data(), recvcounts.data(),
+		                   MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+
+		// Step 4: Run one reduce_scatter iteration on GPU
+		q.memset(block_C, 0, full_c_elems * sizeof(ElementC)).wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+		run_iteration(q, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+		q.wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		// Step 5: Copy GPU result (this rank's shard from block_C) to host
+		std::vector<ElementC> host_result(shard_c_elems);
+		size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
+		q.memcpy(host_result.data(), block_C + local_off, shard_c_elems * sizeof(ElementC)).wait();
+
+		// Step 6: Compare
+		double max_abs_diff = 0.0;
+		double max_rel_diff = 0.0;
+		size_t mismatch_count = 0;
+		for (size_t i = 0; i < shard_c_elems; ++i) {
+			double ref = static_cast<double>(host_ref[i]);
+			double val = static_cast<double>(host_result[i]);
+			double diff = std::abs(ref - val);
+			double rel = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
+			max_abs_diff = std::max(max_abs_diff, diff);
+			max_rel_diff = std::max(max_rel_diff, rel);
+			if (rel > 1e-2) mismatch_count++;
+		}
+
+		bool passed = (mismatch_count == 0);
+		printf("[rank %d] Verification %s: max_abs=%.6e, max_rel=%.6e, mismatches=%zu/%zu (expected=%.3f)\n",
+		       rank, passed ? "PASSED" : "FAILED",
+		       max_abs_diff, max_rel_diff, mismatch_count, shard_c_elems,
+		       static_cast<double>(host_ref[0]));
+		return passed;
 	}
 
 	cutlass::Status run(
@@ -396,19 +482,22 @@ struct ExampleRunner {
 			if (block_A) sycl::free(block_A, *current_q_);
 			if (block_B) sycl::free(block_B, *current_q_);
 			if (block_C) sycl::free(block_C, *current_q_);
-			close_ipc_ptrs(*current_q_, opened_p2p_bases_);
-			remote_p2p_ptrs_.clear();
-			if (local_p2p_)       { sycl::free(local_p2p_,       *current_q_); local_p2p_ = nullptr; }
-			if (stacked_partials_){ sycl::free(stacked_partials_, *current_q_); stacked_partials_ = nullptr; }
 		};
 
 		initialize(block_A, block_B, block_C, options, hw_info, device, rank, world_size);
 		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 
+		// verification
+		if (options.verify != 0 && !verify(block_A, block_B, block_C, options, hw_info, rank, world_size)) {
+			std::cerr << "[rank " << rank << "] verification failed!" << std::endl;
+			cleanup();
+			return cutlass::Status::kErrorInternal;
+		}
+		MPI_Barrier(MPI_COMM_WORLD);
+
 		// warmup
 		constexpr int kWarmupIters = 10;
-
 		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
 			run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);

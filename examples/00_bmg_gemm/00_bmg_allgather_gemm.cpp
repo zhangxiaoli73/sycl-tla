@@ -34,6 +34,7 @@ struct Options {
 	int iterations = 20;
 	int debug_log = 1;
 	int gemm_only = 0;
+	int verify = 0;
 	float alpha = 1.0f;
 	float beta = 0.0f;
 
@@ -56,6 +57,7 @@ struct Options {
 		cmd.get_cmd_line_argument("iterations", iterations, 20);
 		cmd.get_cmd_line_argument("debug_log", debug_log, 1);
 		cmd.get_cmd_line_argument("gemm_only", gemm_only, 0);
+		cmd.get_cmd_line_argument("verify", verify, 0);
 	}
 
 	std::ostream& print_usage(std::ostream& out) const {
@@ -66,7 +68,8 @@ struct Options {
 				<< "  --l=<int>        batch count\n"
 				<< "  --iterations=<int>\n"
 				<< "  --debug_log=<int> 0/1 progress logs (default 1)\n"
-				<< "  --gemm_only=<int> 0/1 run gemm_only path (default 0)\n\n";
+				<< "  --gemm_only=<int> 0/1 run gemm_only path (default 0)\n"
+				<< "  --verify=<int>    0/1 run accuracy verification (default 0)\n\n";
 		return out;
 	}
 };
@@ -389,6 +392,110 @@ struct ExampleRunner {
 		return op(q, full_A, B, final_C, options, hw_info, ctx, dev, rank, world_size);
 	}
 
+	bool verify(
+			ElementA* local_A,
+			ElementB* B,
+			ElementOutput* final_C,
+			Options const& options,
+			cutlass::KernelHardwareInfo const& hw_info,
+			int rank,
+			int world_size) {
+		auto& q = *current_q_;
+		int local_m = options.m / world_size;
+		size_t local_a_elems = static_cast<size_t>(local_m) * options.k;
+		size_t full_a_elems = static_cast<size_t>(options.m) * options.k;
+		size_t b_elems = static_cast<size_t>(options.n) * options.k;
+		size_t full_c_elems = static_cast<size_t>(options.m) * options.n;
+		size_t shard_c_elems = static_cast<size_t>(local_m) * options.n;
+
+		// Fill local_A and B with non-zero values
+		float a_val = 1.0f;
+		float b_val = 1.0f;
+		q.submit([&](sycl::handler& h) {
+			h.parallel_for(sycl::range<1>(local_a_elems), [=](sycl::id<1> i) {
+				local_A[i] = static_cast<ElementA>(a_val);
+			});
+		});
+		q.submit([&](sycl::handler& h) {
+			h.parallel_for(sycl::range<1>(b_elems), [=](sycl::id<1> i) {
+				B[i] = static_cast<ElementB>(b_val);
+			});
+		});
+		q.wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		// Step 1: MPI_Allgather local_A → host_full_A, upload to GPU
+		std::vector<ElementA> host_local_a(local_a_elems);
+		q.memcpy(host_local_a.data(), local_A, local_a_elems * sizeof(ElementA)).wait();
+
+		std::vector<ElementA> host_full_a(full_a_elems);
+		MPI_Allgather(host_local_a.data(), static_cast<int>(local_a_elems * sizeof(ElementA)), MPI_BYTE,
+		              host_full_a.data(), static_cast<int>(local_a_elems * sizeof(ElementA)), MPI_BYTE,
+		              MPI_COMM_WORLD);
+
+		ElementA* gpu_full_a = sycl::malloc_device<ElementA>(full_a_elems, q);
+		q.memcpy(gpu_full_a, host_full_a.data(), full_a_elems * sizeof(ElementA)).wait();
+
+		// Step 2: Reference full GEMM (shard by shard) → d_ref[M×N]
+		ElementOutput* d_ref = sycl::malloc_device<ElementOutput>(full_c_elems, q);
+		q.memset(d_ref, 0, full_c_elems * sizeof(ElementOutput)).wait();
+
+		for (int s = 0; s < world_size; ++s) {
+			auto st = run_shard_gemm(q,
+				gpu_full_a + static_cast<size_t>(s) * local_a_elems,
+				B,
+				d_ref + static_cast<size_t>(s) * shard_c_elems,
+				d_ref + static_cast<size_t>(s) * shard_c_elems,
+				options.alpha, options.beta, hw_info);
+			if (st != cutlass::Status::kSuccess) {
+				printf("[rank %d] verify: ref GEMM shard %d failed\n", rank, s);
+				sycl::free(gpu_full_a, q);
+				sycl::free(d_ref, q);
+				return false;
+			}
+		}
+		q.wait();
+
+		std::vector<ElementOutput> host_ref(full_c_elems);
+		q.memcpy(host_ref.data(), d_ref, full_c_elems * sizeof(ElementOutput)).wait();
+		sycl::free(gpu_full_a, q);
+		sycl::free(d_ref, q);
+
+		// Step 3: Run one allgather_gemm iteration
+		q.memset(final_C, 0, full_c_elems * sizeof(ElementOutput)).wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+		auto ctx = q.get_context();
+		auto dev = q.get_device();
+		run_iteration(q, local_A, B, final_C, *symm_, options, hw_info, ctx, dev, rank, world_size);
+		q.wait();
+		MPI_Barrier(MPI_COMM_WORLD);
+
+		// Step 4: Copy GPU result to host
+		std::vector<ElementOutput> host_result(full_c_elems);
+		q.memcpy(host_result.data(), final_C, full_c_elems * sizeof(ElementOutput)).wait();
+
+		// Step 5: Compare
+		double max_abs_diff = 0.0;
+		double max_rel_diff = 0.0;
+		size_t mismatch_count = 0;
+		for (size_t i = 0; i < full_c_elems; ++i) {
+			double ref = static_cast<double>(host_ref[i]);
+			double val = static_cast<double>(host_result[i]);
+			double diff = std::abs(ref - val);
+			double rel = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
+			max_abs_diff = std::max(max_abs_diff, diff);
+			max_rel_diff = std::max(max_rel_diff, rel);
+			if (rel > 1e-2) mismatch_count++;
+		}
+
+		bool passed = (mismatch_count == 0);
+		printf("[rank %d] Verification %s: max_abs=%.6e, max_rel=%.6e, mismatches=%zu/%zu (expected=%.3f)\n",
+		       rank, passed ? "PASSED" : "FAILED",
+		       max_abs_diff, max_rel_diff, mismatch_count, full_c_elems,
+		       static_cast<double>(host_ref[0]));
+		return passed;
+	}
+
 	cutlass::Status run(
 			Options const& options,
 			cutlass::KernelHardwareInfo const& hw_info,
@@ -459,6 +566,16 @@ struct ExampleRunner {
 		}
 		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
+
+		// verification (allgather path only)
+		if (options.verify != 0 && options.gemm_only == 0) {
+			if (!verify(local_A, B, final_C, options, hw_info, rank, world_size)) {
+				std::cerr << "[rank " << rank << "] verification failed!" << std::endl;
+				cleanup();
+				return cutlass::Status::kErrorInternal;
+			}
+			MPI_Barrier(MPI_COMM_WORLD);
+		}
 
 		// warmup
 		constexpr int kWarmupIters = 10;
