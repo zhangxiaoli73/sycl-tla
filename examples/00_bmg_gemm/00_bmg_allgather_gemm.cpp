@@ -187,7 +187,7 @@ struct ExampleRunner {
 				cutlass::gemm::GemmUniversalMode::kGemm,
 				shard_problem_,
 				{gathered_A, shard_stride_A, B, stride_B},
-				{{options.alpha, options.beta}, final_C, shard_stride_C, final_C, shard_stride_D},
+				{{options.alpha, options.beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, final_C, shard_stride_D},
 				hw_info};
 
 		if (!gemm_initialized_) {
@@ -214,7 +214,6 @@ struct ExampleRunner {
 			sycl::queue& queue,
 			ElementA* a_ptr,
 			ElementB* b_ptr,
-			ElementC* c_ptr,
 			ElementOutput* d_ptr,
 			ElementCompute alpha,
 			ElementCompute beta,
@@ -224,7 +223,7 @@ struct ExampleRunner {
 				cutlass::gemm::GemmUniversalMode::kGemm,
 				shard_problem_,
 				{a_ptr, shard_stride_A, b_ptr, stride_B},
-				{{alpha, beta}, c_ptr, shard_stride_C, d_ptr, shard_stride_D},
+				{{alpha, beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, d_ptr, shard_stride_D},
 				hw_info};
 
 		if (Gemm::get_workspace_size(args) != 0) {
@@ -278,7 +277,6 @@ struct ExampleRunner {
 					gathered_A + static_cast<size_t>(rank) * shard_a_elems,
 					B,
 					final_C + static_cast<size_t>(rank) * shard_c_elems,
-					final_C + static_cast<size_t>(rank) * shard_c_elems,
 					options.alpha,
 					options.beta,
 					hw_info);
@@ -305,7 +303,6 @@ struct ExampleRunner {
 						queue,
 						local_dst,
 						B,
-						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
 						final_C + static_cast<size_t>(remote_rank) * shard_c_elems,
 						options.alpha,
 						options.beta,
@@ -346,7 +343,6 @@ struct ExampleRunner {
 						current_q,
 						full_A,
 						B,
-						final_C,
 						final_C,
 						options.alpha,
 						options.beta,
@@ -444,7 +440,6 @@ struct ExampleRunner {
 			auto st = run_shard_gemm(q,
 				gpu_full_a + static_cast<size_t>(s) * local_a_elems,
 				B,
-				d_ref + static_cast<size_t>(s) * shard_c_elems,
 				d_ref + static_cast<size_t>(s) * shard_c_elems,
 				options.alpha, options.beta, hw_info);
 			if (st != cutlass::Status::kSuccess) {
@@ -686,7 +681,7 @@ int main(int argc, char** argv) {
 	using ElementComputeEpilogue = float;
 	using ElementInputA = bfloat16_t;
 	using ElementInputB = bfloat16_t;
-	using ElementOutput = float;
+	using ElementOutput = bfloat16_t;
 
 	using LayoutA = cutlass::layout::RowMajor;
 	using LayoutB = cutlass::layout::RowMajor;

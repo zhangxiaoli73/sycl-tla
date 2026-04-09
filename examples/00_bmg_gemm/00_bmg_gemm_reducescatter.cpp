@@ -109,7 +109,7 @@ struct ExampleRunner {
 	void initialize(
 			ElementA* block_A,
 			ElementB* block_B,
-			ElementC* block_C,
+			ElementOutput* block_C,
 			Options const& options,
 			cutlass::KernelHardwareInfo const& hw_info,
 			sycl::device const& device,
@@ -177,7 +177,7 @@ struct ExampleRunner {
 		log_init("before block_B memset");
 		current_q_->memset(block_B, 0, static_cast<size_t>(options.n) * options.k * options.l * sizeof(ElementB)).wait();
 		log_init("before block_C memset");
-		current_q_->memset(block_C, 0, static_cast<size_t>(options.m) * options.n * options.l * sizeof(ElementC)).wait();
+		current_q_->memset(block_C, 0, static_cast<size_t>(options.m) * options.n * options.l * sizeof(ElementOutput)).wait();
 
 		// Initialize GEMM operator once with template args
 		if (!gemm_initialized_) {
@@ -185,7 +185,7 @@ struct ExampleRunner {
 				cutlass::gemm::GemmUniversalMode::kGemm,
 				shard_problem_,
 				{block_A, shard_stride_A, block_B, stride_B},
-				{{options.alpha, options.beta}, block_C, shard_stride_C, block_C, shard_stride_D},
+				{{options.alpha, options.beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, block_C, shard_stride_D},
 				hw_info};
 
 			log_init("before can_implement");
@@ -208,7 +208,6 @@ struct ExampleRunner {
 			sycl::queue& queue,
 			ElementA* a_ptr,
 			ElementB* b_ptr,
-			ElementC* c_ptr,
 			ElementOutput* d_ptr,
 			ElementCompute alpha,
 			ElementCompute beta,
@@ -218,7 +217,7 @@ struct ExampleRunner {
 			cutlass::gemm::GemmUniversalMode::kGemm,
 			shard_problem_,
 			{a_ptr, shard_stride_A, b_ptr, stride_B},
-			{{alpha, beta}, c_ptr, shard_stride_C, d_ptr, shard_stride_D},
+			{{alpha, beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, d_ptr, shard_stride_D},
 			hw_info};
 
 		if (!gemm_initialized_) {
@@ -237,7 +236,7 @@ struct ExampleRunner {
 				sycl::queue& q,
 				ElementA* block_A,
 				ElementB* block_B,
-				ElementC* block_C,
+				ElementOutput* block_C,
 				SymmMemory& symm,
 				Options const& options,
 				cutlass::KernelHardwareInfo const& hw_info,
@@ -264,13 +263,13 @@ struct ExampleRunner {
 				int dst_rank = (rank + step) % world_size;
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
-				// step1: tmp_q, step2, current_q, step3: tmp_q
+				printf("[rank %d] step=%d dst_rank=%d channel=%d queue=%p\n",
+					rank, step, dst_rank, channel, static_cast<void*>(&queue));
 
 				ElementOutput* local_shard_out = local_p2p_ + dst_rank * shard_c_elems;
 				auto st = runner.run_shard_gemm(queue,
 					block_A + static_cast<size_t>(dst_rank) * shard_a_elems,
 					block_B,
-					local_shard_out,
 					local_shard_out,
 					options.alpha, options.beta, hw_info);
 				if (st != cutlass::Status::kSuccess)
@@ -282,7 +281,6 @@ struct ExampleRunner {
 			auto st_local = runner.run_shard_gemm(current_q,
 				block_A + static_cast<size_t>(rank) * shard_a_elems,
 				block_B,
-				local_p2p_ + local_off,
 				local_p2p_ + local_off,
 				options.alpha, options.beta, hw_info);
 			if (st_local != cutlass::Status::kSuccess)
@@ -296,10 +294,10 @@ struct ExampleRunner {
 			// the partial from rank r (for all r in 0..world_size-1).
 			{
 				ElementOutput* recv_slots = local_p2p_;
-				ElementC* out = block_C + local_off;
+				ElementOutput* out = block_C + local_off;
 				int ws = world_size;
 				size_t ce = shard_c_elems;
-				constexpr size_t wg_size = 256;
+				size_t wg_size = current_q.get_device().get_info<sycl::info::device::max_work_group_size>();
 				size_t global_size = ((shard_c_elems + wg_size - 1) / wg_size) * wg_size;
 				size_t n_elems = shard_c_elems;
 				return current_q.submit([&](sycl::handler& h) {
@@ -308,12 +306,12 @@ struct ExampleRunner {
 						[=](sycl::nd_item<1> item) {
 							size_t i = item.get_global_id(0);
 							if (i >= n_elems) return;
-							ElementOutput acc = 0;
+							float acc = 0.0f;
 							#pragma unroll
 							for (int r = 0; r < ws; ++r) {
-								acc += recv_slots[static_cast<size_t>(r) * ce + i];
+								acc += static_cast<float>(recv_slots[static_cast<size_t>(r) * ce + i]);
 							}
-							out[i] = acc;
+							out[i] = static_cast<ElementOutput>(acc);
 						});
 				});
 			}
@@ -324,7 +322,7 @@ struct ExampleRunner {
 			sycl::queue& q,
 			ElementA* block_A,
 			ElementB* block_B,
-			ElementC* block_C,
+			ElementOutput* block_C,
 			SymmMemory& symm,
 			Options const& options,
 			cutlass::KernelHardwareInfo const& hw_info,
@@ -338,7 +336,7 @@ struct ExampleRunner {
 	bool verify(
 			ElementA* block_A,
 			ElementB* block_B,
-			ElementC* block_C,
+			ElementOutput* block_C,
 			Options const& options,
 			cutlass::KernelHardwareInfo const& hw_info,
 			int rank,
@@ -376,7 +374,6 @@ struct ExampleRunner {
 				block_A + static_cast<size_t>(s) * shard_a_elems,
 				block_B,
 				d_full + static_cast<size_t>(s) * shard_c_elems,
-				d_full + static_cast<size_t>(s) * shard_c_elems,
 				options.alpha, options.beta, hw_info);
 			if (st != cutlass::Status::kSuccess) {
 				printf("[rank %d] verify: full GEMM shard %d failed\n", rank, s);
@@ -386,28 +383,33 @@ struct ExampleRunner {
 		}
 		q.wait();
 
-		// Step 2: Copy full GEMM result to host
-		std::vector<ElementOutput> host_full(full_c_elems);
-		q.memcpy(host_full.data(), d_full, full_c_elems * sizeof(ElementOutput)).wait();
+		// Step 2: Copy full GEMM result to host and convert to float for MPI
+		std::vector<ElementOutput> host_full_raw(full_c_elems);
+		q.memcpy(host_full_raw.data(), d_full, full_c_elems * sizeof(ElementOutput)).wait();
 		sycl::free(d_full, q);
 
-		// Step 3: MPI_Reduce_scatter to get reference for this rank's shard
-		std::vector<ElementOutput> host_ref(shard_c_elems);
+		std::vector<float> host_full_f32(full_c_elems);
+		for (size_t i = 0; i < full_c_elems; ++i) {
+			host_full_f32[i] = static_cast<float>(host_full_raw[i]);
+		}
+
+		// Step 3: MPI_Reduce_scatter to get reference for this rank's shard (in float)
+		std::vector<float> host_ref(shard_c_elems);
 		std::vector<int> recvcounts(world_size, static_cast<int>(shard_c_elems));
-		MPI_Reduce_scatter(host_full.data(), host_ref.data(), recvcounts.data(),
+		MPI_Reduce_scatter(host_full_f32.data(), host_ref.data(), recvcounts.data(),
 		                   MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
 
 		// Step 4: Run one reduce_scatter iteration on GPU
-		q.memset(block_C, 0, full_c_elems * sizeof(ElementC)).wait();
+		q.memset(block_C, 0, full_c_elems * sizeof(ElementOutput)).wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 		run_iteration(q, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
 		// Step 5: Copy GPU result (this rank's shard from block_C) to host
-		std::vector<ElementC> host_result(shard_c_elems);
+		std::vector<ElementOutput> host_result(shard_c_elems);
 		size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
-		q.memcpy(host_result.data(), block_C + local_off, shard_c_elems * sizeof(ElementC)).wait();
+		q.memcpy(host_result.data(), block_C + local_off, shard_c_elems * sizeof(ElementOutput)).wait();
 
 		// Step 6: Compare
 		double max_abs_diff = 0.0;
@@ -462,7 +464,7 @@ struct ExampleRunner {
 
 		ElementA* block_A = sycl::malloc_device<ElementA>(a_elems, *current_q_);
 		ElementB* block_B = sycl::malloc_device<ElementB>(b_elems, *current_q_);
-		ElementC* block_C = sycl::malloc_device<ElementC>(c_elems, *current_q_);
+		ElementOutput* block_C = sycl::malloc_device<ElementOutput>(c_elems, *current_q_);
 		auto mb = [](size_t bytes) {
 			return static_cast<double>(bytes) / (1024.0 * 1024.0);
 		};
@@ -470,12 +472,12 @@ struct ExampleRunner {
 				rank,
 				mb(a_elems * sizeof(ElementA)),
 				mb(b_elems * sizeof(ElementB)),
-				mb(c_elems * sizeof(ElementC)));
+				mb(c_elems * sizeof(ElementOutput)));
 		if (block_A == nullptr || block_B == nullptr || block_C == nullptr) {
 			throw std::runtime_error(
 				"Device allocation failed: A=" + std::to_string(mb(a_elems * sizeof(ElementA))) +
 				" MiB, B=" + std::to_string(mb(b_elems * sizeof(ElementB))) +
-				" MiB, C=" + std::to_string(mb(c_elems * sizeof(ElementC))) + " MiB.");
+				" MiB, C=" + std::to_string(mb(c_elems * sizeof(ElementOutput))) + " MiB.");
 		}
 
 		auto cleanup = [&]() {
@@ -592,7 +594,7 @@ int main(int argc, char** argv) {
 	using ElementComputeEpilogue = float;
 	using ElementInputA = bfloat16_t;
 	using ElementInputB = bfloat16_t;
-	using ElementOutput = float;
+	using ElementOutput = bfloat16_t;
 
 	using LayoutA = cutlass::layout::RowMajor;
 	using LayoutB = cutlass::layout::RowMajor;
