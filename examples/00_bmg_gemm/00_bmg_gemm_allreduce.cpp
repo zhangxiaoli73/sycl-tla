@@ -265,8 +265,8 @@ struct ExampleRunner {
 				int dst_rank = (rank + step) % world_size;
 				int channel = step % 2;
 				auto& queue = (channel == 0) ? current_q : tmp_q;
-				// printf("[rank %d] step=%d dst_rank=%d channel=%d queue=%p\n",
-				// 	rank, step, dst_rank, channel, static_cast<void*>(&queue));
+				printf("[rank %d] step=%d dst_rank=%d channel=%d queue=%p\n",
+					rank, step, dst_rank, channel, static_cast<void*>(&queue));
 
 				ElementOutput* local_shard_out = local_p2p_ + dst_rank * shard_c_elems;
 				auto st = runner.run_shard_gemm(queue,
@@ -296,8 +296,7 @@ struct ExampleRunner {
 			// 每个 work-item 用 sycl::vec<uint16_t, NUM_PER_TH> 做向量化加载/存储，
 			// 边界内走 vec 路径，边界外逐元素处理。
 			constexpr int NUM_PER_TH = 8;   // bf16 * 8 = 16B（非常适合 Xe）
-			const int WG_SIZE = static_cast<int>(
-				current_q.get_device().get_info<sycl::info::device::max_work_group_size>()) / NUM_PER_TH;
+			constexpr int WG_SIZE = 1024;
 
 			const int64_t n_elems = static_cast<int64_t>(shard_c_elems);
 			const int64_t vec_elems = n_elems / NUM_PER_TH;
@@ -305,20 +304,18 @@ struct ExampleRunner {
 			const int64_t TILE_SIZE = WG_SIZE * NUM_PER_TH;
 			const int64_t n_groups = (n_elems + TILE_SIZE - 1) / TILE_SIZE;
 			
-			using SyclBF16 = sycl::ext::oneapi::bfloat16;
-
 			ElementOutput* local_buffer_0 = local_p2p_;
 			ElementOutput* local_buffer_1 = local_p2p_ + shard_c_elems;
 			ElementOutput* local_buffer_2 = local_p2p_ + 2 * shard_c_elems;
 			ElementOutput* local_buffer_3 = local_p2p_ + 3 * shard_c_elems;
 
 			// vector pointer（一次性转换，避免 kernel 内重复 cast）
-			auto out_vec = reinterpret_cast<sycl::vec<SyclBF16, NUM_PER_TH>*>(block_C + local_off);
+			auto out_vec = reinterpret_cast<sycl::vec<ElementOutput, NUM_PER_TH>*>(block_C + local_off);
 
-			auto buf0 = reinterpret_cast<const sycl::vec<SyclBF16, NUM_PER_TH>*>(local_buffer_0);
-			auto buf1 = reinterpret_cast<const sycl::vec<SyclBF16, NUM_PER_TH>*>(local_buffer_1);
-			auto buf2 = reinterpret_cast<const sycl::vec<SyclBF16, NUM_PER_TH>*>(local_buffer_2);
-			auto buf3 = reinterpret_cast<const sycl::vec<SyclBF16, NUM_PER_TH>*>(local_buffer_3);
+			auto buf0 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_0);
+			auto buf1 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_1);
+			auto buf2 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_2);
+			auto buf3 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_3);
 
 			return current_q.submit([&](sycl::handler& h) {
 				h.parallel_for<class local_reduction_vec_kernel>(
@@ -326,7 +323,8 @@ struct ExampleRunner {
 						sycl::range<1>(n_groups * WG_SIZE),
 						sycl::range<1>(WG_SIZE)),
 					[=](sycl::nd_item<1> item)
-					[[sycl::reqd_sub_group_size(16)]] {
+						[[intel::reqd_sub_group_size(16)]] {
+
 						const int64_t base = item.get_group(0) * TILE_SIZE;
 						const int64_t offset = item.get_local_id(0) * NUM_PER_TH;
 						const int64_t global_idx = base + offset;
@@ -336,7 +334,7 @@ struct ExampleRunner {
 
 						// boundary check（vector 级别）
 						if (vec_idx < vec_elems) {
-							sycl::vec<SyclBF16, NUM_PER_TH> sum = buf0[vec_idx];
+							sycl::vec<ElementOutput, NUM_PER_TH> sum = buf0[vec_idx];
 							sum += buf1[vec_idx];
 							sum += buf2[vec_idx];
 							sum += buf3[vec_idx];

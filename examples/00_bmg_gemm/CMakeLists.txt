@@ -168,3 +168,8 @@ cutlass_example_add_executable(
   TEST_COMMAND_OPTIONS
   TEST_BATCHES
 )
+
+cutlass_example_add_executable(
+  test_local_reduction
+  test_local_reduction.cpp
+)
