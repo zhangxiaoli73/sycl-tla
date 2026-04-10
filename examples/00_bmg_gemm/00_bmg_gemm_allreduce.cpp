@@ -1,23 +1,18 @@
 ﻿
-#include "cutlass/epilogue/collective/default_epilogue.hpp"
-#include "cutlass/epilogue/collective/xe_epilogue.hpp"
-#include "cutlass/epilogue/fusion/xe_callbacks.hpp"
-#include "cutlass/gemm/collective/collective_mma.hpp"
-#include "cutlass/gemm/device/gemm_universal.h"
-#include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include <mpi.h>
 
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <cute/tensor.hpp>
 #include <memory>
 #include <stdexcept>
 #include <vector>
 
+#include <cute/tensor.hpp>
+
 #include "symm.hpp"
+#include "gemm_allreduce_kernel.hpp"
 #include "cutlass/util/command_line.h"
-#include "cutlass/util/packed_stride.hpp"
 #include "helper.h"
 #include "sycl_common.hpp"
 
@@ -29,12 +24,10 @@ struct Options {
 	int m = 8192;
 	int n = 4096;
 	int k = 3584;
-	int l = 1;
 	int iterations = 20;
 	int debug_log = 1;
 	int verify = 0;
 	float alpha = 1.0f;
-	float beta = 0.0f;
 
 	void parse(int argc, char **args) {
 		std::vector<char const*> cargs(argc);
@@ -49,20 +42,18 @@ struct Options {
 		cmd.get_cmd_line_argument("m", m, 8192);
 		cmd.get_cmd_line_argument("n", n, 4096);
 		cmd.get_cmd_line_argument("k", k, 3584);
-		cmd.get_cmd_line_argument("l", l, 1);
 		cmd.get_cmd_line_argument("alpha", alpha, 1.0f);
-		cmd.get_cmd_line_argument("beta", beta, 0.0f);
 		cmd.get_cmd_line_argument("iterations", iterations, 20);
 		cmd.get_cmd_line_argument("debug_log", debug_log, 1);
 		cmd.get_cmd_line_argument("verify", verify, 0);
 	}
 
 	std::ostream& print_usage(std::ostream& out) const {
-		out << "BMG GEMM Reduce-Scatter Example\n\n"
-			<< "  --m=<int>         M extent (global, must be divisible by TP)\n"
+		out << "BMG GEMM Allreduce Example (Option A: fused cute kernel)\n\n"
+			<< "  --m=<int>         M extent\n"
 			<< "  --n=<int>         N extent\n"
 			<< "  --k=<int>         K extent\n"
-			<< "  --l=<int>         batch count\n"
+			<< "  --alpha=<float>   alpha scaling (default 1.0)\n"
 			<< "  --iterations=<int>\n"
 			<< "  --debug_log=<int> 0/1 progress logs (default 1)\n"
 			<< "  --verify=<int>    0/1 run accuracy verification (default 0)\n\n";
@@ -70,381 +61,273 @@ struct Options {
 	}
 };
 
-template <class Gemm>
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Tensor type aliases (RowMajor A, RowMajor B, RowMajor C/D)
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+using ElementA = bfloat16_t;
+using ElementB = bfloat16_t;
+using ElementC = bfloat16_t;  // IPC-shared buffer and output
+
+using TensorA_t = Tensor<ViewEngine<gmem_ptr<ElementA*>>,
+                         Layout<tuple<int, int>, tuple<int, C<1>>>>;  // (M,K) RowMajor
+using TensorB_t = Tensor<ViewEngine<gmem_ptr<ElementB*>>,
+                         Layout<tuple<int, int>, tuple<C<1>, int>>>;  // (N,K) ColMajor-ish (RowMajor B with stride(ldb, 1) → actually (N,K) with stride(1, ldb))
+using TensorC_t = Tensor<ViewEngine<gmem_ptr<ElementC*>>,
+                         Layout<tuple<int, int>, tuple<int, C<1>>>>;  // (M,N) RowMajor
+using TensorD_t = TensorC_t;  // same layout
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Runner class: manages IPC, launches fused kernel, benchmarks
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct ExampleRunner {
-	using StrideA = typename Gemm::GemmKernel::StrideA;
-	using StrideB = typename Gemm::GemmKernel::StrideB;
-	using StrideC = typename Gemm::GemmKernel::StrideC;
-	using StrideD = typename Gemm::GemmKernel::StrideD;
-
-	using ElementA = typename Gemm::ElementA;
-	using ElementB = typename Gemm::ElementB;
-	using ElementAccumulator = typename Gemm::ElementAccumulator;
-
-	using CollectiveEpilogue = typename Gemm::CollectiveEpilogue;
-	using ElementC = typename Gemm::ElementC;
-	using ElementOutput = typename CollectiveEpilogue::ElementOutput;
-	using ElementCompute = typename CollectiveEpilogue::ElementCompute;
-
-	using ProblemShapeType = typename Gemm::GemmKernel::ProblemShape;
-
-	StrideA stride_A;
-	StrideB stride_B;
-	StrideC stride_C;
-	StrideD stride_D;
-	ProblemShapeType shard_problem_{};
-	StrideA shard_stride_A{};
-	StrideC shard_stride_C{};
-	StrideD shard_stride_D{};
-	int local_rows_ = 0;
-	std::unique_ptr<sycl::queue> current_q_;
-	std::unique_ptr<sycl::queue> tmp_q_;
+	std::unique_ptr<sycl::queue> q_;
 	std::unique_ptr<SymmMemory> symm_;
-	Gemm gemm_op_;
-	bool gemm_initialized_ = false;
 
-	size_t chunk_elements_ = 0;
-	size_t total_elements_ = 0;
+	// Fused kernel IPC signal resources (tile-level)
+	int* signal_local_ = nullptr;
+	int** ipc_signal_ptrs_ = nullptr;   // device array [world_size]
+	int num_tiles_ = 0;
+	std::vector<void*> opened_signal_bases_;
 
-	void initialize(
-			ElementA* block_A,
-			ElementB* block_B,
-			ElementOutput* block_C,
-			Options const& options,
-			cutlass::KernelHardwareInfo const& hw_info,
-			sycl::device const& device,
-			int rank,
-			int world_size) {
-		auto log_init = [&](char const* msg) {
-			if (options.debug_log) {
-				std::cout << "[rank " << rank << "] [init] " << msg << std::endl;
-			}
-		};
+	void initialize_tile_signals(int m, int n, int rank, int world_size,
+	                             TensorA_t const& A, TensorB_t const& B, TensorC_t const& C) {
+		auto mma = choose_tiled_mma_ar(A, B, C);
+		int tile_m = int(get<0>(mma.tile_mnk()));
+		int tile_n = int(get<1>(mma.tile_mnk()));
+		int num_m_tiles = int(ceil_div(m, tile_m));
+		int num_n_tiles = int(ceil_div(n, tile_n));
+		num_tiles_ = num_m_tiles * num_n_tiles;
 
-		log_init("initialize begin");
-		int local_rows = options.m / world_size;
+		signal_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, *q_);
+		q_->memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
 
-		if (!current_q_) {
-			log_init("creating current_q");
-			auto ctx = sycl::context(device);
-			current_q_ = std::make_unique<sycl::queue>(
-					ctx,
-					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
-			log_init("current_q created");
+		// Exchange IPC handles for signal buffer
+		std::vector<void*> host_signal_ptrs = exchange_ipc_ptrs(
+		    signal_local_, rank, world_size, *q_, opened_signal_bases_);
+
+		// Copy to device array
+		ipc_signal_ptrs_ = sycl::malloc_device<int*>(world_size, *q_);
+		std::vector<int*> host_arr(world_size);
+		for (int i = 0; i < world_size; ++i) {
+			host_arr[i] = reinterpret_cast<int*>(host_signal_ptrs[i]);
 		}
-
-		auto ctx = current_q_->get_context();
-		if (!tmp_q_) {
-			log_init("creating tmp_q");
-			tmp_q_ = std::make_unique<sycl::queue>(
-					ctx,
-					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
-			log_init("tmp_q created");
-		}
-
-		if (!symm_) {
-			log_init("creating SymmMemory");
-			// Pass global M so symm buffer = world_size * M * N * 2 bytes,
-			// large enough for world_size slots of (local_rows * N) floats.
-			symm_ = std::make_unique<SymmMemory>(options.m, options.n, options.k, rank, world_size, *current_q_, 8);
-			log_init("SymmMemory created");
-		}
-
-		stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(options.m, options.k, options.l));
-		stride_B = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(options.n, options.k, options.l));
-		stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(options.m, options.n, options.l));
-		stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(options.m, options.n, options.l));
-
-		if (options.debug_log) {
-			printf("[rank %d] GEMM shard per call: M=%d N=%d K=%d L=%d\n",
-					rank, local_rows, options.n, options.k, options.l);
-		}
-
-		chunk_elements_ = static_cast<size_t>(local_rows) * options.n * options.l;
-		total_elements_ = static_cast<size_t>(options.m) * options.n * options.l;
-
-		// Pre-compute shard strides (same for every run_shard_gemm call)
-		local_rows_ = local_rows;
-		shard_problem_ = ProblemShapeType{local_rows, options.n, options.k, options.l};
-		shard_stride_A = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(local_rows, options.k, options.l));
-		shard_stride_C = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(local_rows, options.n, options.l));
-		shard_stride_D = cutlass::make_cute_packed_stride(StrideD{}, cute::make_shape(local_rows, options.n, options.l));
-
-		log_init("before block_A memset");
-		current_q_->memset(block_A, 0, static_cast<size_t>(options.m) * options.k * options.l * sizeof(ElementA)).wait();
-		log_init("before block_B memset");
-		current_q_->memset(block_B, 0, static_cast<size_t>(options.n) * options.k * options.l * sizeof(ElementB)).wait();
-		log_init("before block_C memset");
-		current_q_->memset(block_C, 0, static_cast<size_t>(options.m) * options.n * options.l * sizeof(ElementOutput)).wait();
-
-		// Initialize GEMM operator once with template args
-		if (!gemm_initialized_) {
-			typename Gemm::GemmKernel::Arguments template_args{
-				cutlass::gemm::GemmUniversalMode::kGemm,
-				shard_problem_,
-				{block_A, shard_stride_A, block_B, stride_B},
-				{{options.alpha, options.beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, block_C, shard_stride_D},
-				hw_info};
-
-			log_init("before can_implement");
-			auto st = gemm_op_.can_implement(template_args);
-			if (st != cutlass::Status::kSuccess) {
-				throw std::runtime_error("GEMM cannot implement shard args.");
-			}
-			log_init("before gemm initialize");
-			st = gemm_op_.initialize(template_args, nullptr, current_q_.get());
-			if (st != cutlass::Status::kSuccess) {
-				throw std::runtime_error("GEMM initialize failed.");
-			}
-			gemm_initialized_ = true;
-			log_init("GEMM operator initialized");
-		}
-		log_init("initialize end");
+		q_->memcpy(ipc_signal_ptrs_, host_arr.data(), world_size * sizeof(int*)).wait();
 	}
 
-	cutlass::Status run_shard_gemm(
-			sycl::queue& queue,
-			ElementA* a_ptr,
-			ElementB* b_ptr,
-			ElementOutput* d_ptr,
-			ElementCompute alpha,
-			ElementCompute beta,
-			cutlass::KernelHardwareInfo const& hw_info) {
-
-		typename Gemm::GemmKernel::Arguments args{
-			cutlass::gemm::GemmUniversalMode::kGemm,
-			shard_problem_,
-			{a_ptr, shard_stride_A, b_ptr, stride_B},
-			{{alpha, beta}, static_cast<ElementC const*>(nullptr), shard_stride_C, d_ptr, shard_stride_D},
-			hw_info};
-
-		if (!gemm_initialized_) {
-			return cutlass::Status::kErrorInternal;
-		}
-
-		auto st = gemm_op_.update(args, nullptr);
-		if (st != cutlass::Status::kSuccess) return st;
-		return gemm_op_.run(&queue);
+	void release_tile_signals() {
+		close_ipc_ptrs(*q_, opened_signal_bases_);
+		if (ipc_signal_ptrs_) { sycl::free(ipc_signal_ptrs_, *q_); ipc_signal_ptrs_ = nullptr; }
+		if (signal_local_) { sycl::free(signal_local_, *q_); signal_local_ = nullptr; }
 	}
 
-	struct reduce_scatter {
-		ExampleRunner& runner;
-
-		sycl::event operator()(
-				sycl::queue& q,
-				ElementA* block_A,
-				ElementB* block_B,
-				ElementOutput* block_C,
-				SymmMemory& symm,
-				Options const& options,
-				cutlass::KernelHardwareInfo const& hw_info,
-				int rank,
-				int world_size) const {
-			int local_rows = options.m / world_size;
-			size_t shard_c_elems = static_cast<size_t>(local_rows) * options.n * options.l;
-			size_t shard_a_elems = static_cast<size_t>(local_rows) * options.k * options.l;
-			size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
-			size_t shard_bytes = shard_c_elems * sizeof(ElementOutput);
-
-			ElementOutput* local_p2p_ = reinterpret_cast<ElementOutput*>(symm.local_data_ptr_);
-			auto& remote_p2p_ptrs_ = symm.remote_data_ptrs_;
-
-			if (local_p2p_ == nullptr || remote_p2p_ptrs_.empty()) {
-				throw std::runtime_error("IPC pointers are null.");
-			}
-
-			auto& current_q = *runner.current_q_;
-			auto& tmp_q = *runner.tmp_q_;
-
-			symm.barrier(0, current_q);
-			
-			// Phase 1+2: run local GEMM for each shard and push to destination peer.
-			for (int step = 1; step < world_size; ++step) {
-				int dst_rank = (rank + step) % world_size;
-				int channel = step % 2;
-				auto& queue = (channel == 0) ? current_q : tmp_q;
-				printf("[rank %d] step=%d dst_rank=%d channel=%d queue=%p\n",
-					rank, step, dst_rank, channel, static_cast<void*>(&queue));
-
-				ElementOutput* local_shard_out = local_p2p_ + dst_rank * shard_c_elems;
-				auto st = runner.run_shard_gemm(queue,
-					block_A + static_cast<size_t>(dst_rank) * shard_a_elems,
-					block_B,
-					local_shard_out,
-					options.alpha, options.beta, hw_info);
-				if (st != cutlass::Status::kSuccess)
-					throw std::runtime_error("run_shard_gemm (remote shard) failed.");
-				ElementOutput* remote_dst = reinterpret_cast<ElementOutput*>(remote_p2p_ptrs_[dst_rank]) + rank * shard_c_elems;
-				queue.memcpy(remote_dst, local_shard_out, shard_bytes);
-			}
-
-			auto st_local = runner.run_shard_gemm(current_q,
-				block_A + static_cast<size_t>(rank) * shard_a_elems,
-				block_B,
-				local_p2p_ + local_off,
-				options.alpha, options.beta, hw_info);
-			if (st_local != cutlass::Status::kSuccess)
-				throw std::runtime_error("run_shard_gemm (local shard) failed.");
-
-			current_q.ext_oneapi_submit_barrier({tmp_q.ext_oneapi_submit_barrier()});
-			symm.barrier(0, current_q);
-
-			// Phase 3: local reduction — sycl::vec 向量化版本
-			// 参考 bitsandbytes xpu_kernels.cpp 的 reinterpret_cast<sycl::vec> 模式，
-			// 每个 work-item 用 sycl::vec<uint16_t, NUM_PER_TH> 做向量化加载/存储，
-			// 边界内走 vec 路径，边界外逐元素处理。
-			constexpr int NUM_PER_TH = 8;   // bf16 * 8 = 16B（非常适合 Xe）
-			constexpr int WG_SIZE = 1024;
-
-			const int64_t n_elems = static_cast<int64_t>(shard_c_elems);
-			const int64_t vec_elems = n_elems / NUM_PER_TH;
-
-			const int64_t TILE_SIZE = WG_SIZE * NUM_PER_TH;
-			const int64_t n_groups = (n_elems + TILE_SIZE - 1) / TILE_SIZE;
-			
-			ElementOutput* local_buffer_0 = local_p2p_;
-			ElementOutput* local_buffer_1 = local_p2p_ + shard_c_elems;
-			ElementOutput* local_buffer_2 = local_p2p_ + 2 * shard_c_elems;
-			ElementOutput* local_buffer_3 = local_p2p_ + 3 * shard_c_elems;
-
-			// vector pointer（一次性转换，避免 kernel 内重复 cast）
-			auto out_vec = reinterpret_cast<sycl::vec<ElementOutput, NUM_PER_TH>*>(block_C + local_off);
-
-			auto buf0 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_0);
-			auto buf1 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_1);
-			auto buf2 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_2);
-			auto buf3 = reinterpret_cast<const sycl::vec<ElementOutput, NUM_PER_TH>*>(local_buffer_3);
-
-			return current_q.submit([&](sycl::handler& h) {
-				h.parallel_for<class local_reduction_vec_kernel>(
-					sycl::nd_range<1>(
-						sycl::range<1>(n_groups * WG_SIZE),
-						sycl::range<1>(WG_SIZE)),
-					[=](sycl::nd_item<1> item)
-						[[intel::reqd_sub_group_size(16)]] {
-
-						const int64_t base = item.get_group(0) * TILE_SIZE;
-						const int64_t offset = item.get_local_id(0) * NUM_PER_TH;
-						const int64_t global_idx = base + offset;
-
-						// vector index
-						const int64_t vec_idx = global_idx / NUM_PER_TH;
-
-						// boundary check（vector 级别）
-						if (vec_idx < vec_elems) {
-							sycl::vec<ElementOutput, NUM_PER_TH> sum = buf0[vec_idx];
-							sum += buf1[vec_idx];
-							sum += buf2[vec_idx];
-							sum += buf3[vec_idx];
-							out_vec[vec_idx] = sum;
-						}
-					});
-			});
-		}
-	};
-
-	sycl::event run_iteration(
-			sycl::queue& q,
-			ElementA* block_A,
-			ElementB* block_B,
-			ElementOutput* block_C,
-			SymmMemory& symm,
-			Options const& options,
-			cutlass::KernelHardwareInfo const& hw_info,
+	// Launch fused GEMM + Allreduce kernel
+	void run_fused(
+			TensorA_t const& A,
+			TensorB_t const& B,
+			TensorC_t& C,
+			TensorD_t& D,
+			float alpha,
 			int rank,
-			int world_size) {
+			int world_size,
+			int m,
+			int n) {
+		namespace syclex = sycl::ext::oneapi::experimental;
+		namespace intelex = sycl::ext::intel::experimental;
 
-		reduce_scatter op{*this};
-		return op(q, block_A, block_B, block_C, symm, options, hw_info, rank, world_size);
+		syclex::properties kernel_props{syclex::sub_group_size<16>,
+		                                intelex::grf_size<256>};
+
+		auto mma = choose_tiled_mma_ar(A, B, C);
+		int tile_m = int(get<0>(mma.tile_mnk()));
+		int tile_n = int(get<1>(mma.tile_mnk()));
+		int num_n_tiles = int(ceil_div(n, tile_n));
+
+		// Reset signals before each launch
+		q_->memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
+
+		void** ipc_data_ptrs = symm_->remote_data_ptrs_dev_;
+		int** ipc_signal_ptrs = ipc_signal_ptrs_;
+
+		sycl::range<2> local = {size(mma), 1};
+		sycl::range<2> global = {
+		    local[0] * ceil_div(n, tile_n),
+		    local[1] * ceil_div(m, tile_m)};
+
+		q_->submit([&](sycl::handler& h) {
+			h.parallel_for<GemmAllreduceKernelName<ElementA, ElementB>>(
+			    sycl::nd_range<2>(global, local), kernel_props,
+			    [=](sycl::nd_item<2>) {
+			        gemm_allreduce_device(A, B, C, D, mma, alpha,
+			                              ipc_signal_ptrs, ipc_data_ptrs,
+			                              rank, world_size, m, n, num_n_tiles);
+			    });
+		});
 	}
 
 	bool verify(
 			ElementA* block_A,
 			ElementB* block_B,
-			ElementOutput* block_C,
+			ElementC* block_D,
 			Options const& options,
-			cutlass::KernelHardwareInfo const& hw_info,
 			int rank,
 			int world_size) {
-		auto& q = *current_q_;
-		int local_rows = options.m / world_size;
-		size_t shard_c_elems = static_cast<size_t>(local_rows) * options.n * options.l;
-		size_t shard_a_elems = static_cast<size_t>(local_rows) * options.k * options.l;
-		size_t full_c_elems = static_cast<size_t>(options.m) * options.n * options.l;
-		size_t a_elems = static_cast<size_t>(options.m) * options.k * options.l;
-		size_t b_elems = static_cast<size_t>(options.n) * options.k * options.l;
+		auto& q = *q_;
+		int m = options.m, n = options.n, k = options.k;
+		size_t a_elems = static_cast<size_t>(m) * k;
+		size_t b_elems = static_cast<size_t>(n) * k;
+		size_t c_elems = static_cast<size_t>(m) * n;
 
-		// Fill A and B with non-zero values for meaningful verification
-		float a_val = 1.0f;
-		float b_val = 1.0f;
+		// Fill A and B with non-zero values
 		q.submit([&](sycl::handler& h) {
 			h.parallel_for(sycl::range<1>(a_elems), [=](sycl::id<1> i) {
-				block_A[i] = static_cast<ElementA>(a_val);
+				block_A[i] = static_cast<ElementA>(1.0f);
 			});
 		});
 		q.submit([&](sycl::handler& h) {
 			h.parallel_for(sycl::range<1>(b_elems), [=](sycl::id<1> i) {
-				block_B[i] = static_cast<ElementB>(b_val);
+				block_B[i] = static_cast<ElementB>(1.0f);
 			});
 		});
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
-		// Step 1: Full GEMM — run world_size shard GEMMs to produce D_full[M x N]
-		ElementOutput* d_full = sycl::malloc_device<ElementOutput>(full_c_elems, q);
-		q.memset(d_full, 0, full_c_elems * sizeof(ElementOutput)).wait();
+		// Reference: single-rank GEMM → MPI_Allreduce
+		ElementC* d_ref = sycl::malloc_device<ElementC>(c_elems, q);
+		q.memset(d_ref, 0, c_elems * sizeof(ElementC)).wait();
 
-		for (int s = 0; s < world_size; ++s) {
-			auto st = run_shard_gemm(q,
-				block_A + static_cast<size_t>(s) * shard_a_elems,
-				block_B,
-				d_full + static_cast<size_t>(s) * shard_c_elems,
-				options.alpha, options.beta, hw_info);
-			if (st != cutlass::Status::kSuccess) {
-				printf("[rank %d] verify: full GEMM shard %d failed\n", rank, s);
-				sycl::free(d_full, q);
-				return false;
-			}
+		// Run a standalone GEMM (no IPC) to get reference
+		auto A_ref = make_tensor(make_gmem_ptr(block_A),
+		    make_layout(make_shape(m, k), make_stride(k, Int<1>{})));
+		auto B_ref = make_tensor(make_gmem_ptr(block_B),
+		    make_layout(make_shape(n, k), make_stride(Int<1>{}, n)));
+		auto C_ref = make_tensor(make_gmem_ptr(d_ref),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
+
+		// Simple standalone GEMM kernel (no fusion)
+		{
+			namespace syclex = sycl::ext::oneapi::experimental;
+			namespace intelex = sycl::ext::intel::experimental;
+			syclex::properties kernel_props{syclex::sub_group_size<16>,
+			                                intelex::grf_size<256>};
+			auto mma = choose_tiled_mma_ar(A_ref, B_ref, C_ref);
+			float a = options.alpha;
+			sycl::range<2> local = {size(mma), 1};
+			sycl::range<2> global = {
+			    local[0] * ceil_div(n, int(get<1>(mma.tile_mnk()))),
+			    local[1] * ceil_div(m, int(get<0>(mma.tile_mnk())))};
+			q.submit([&](sycl::handler& h) {
+				h.parallel_for(
+				    sycl::nd_range<2>(global, local), kernel_props,
+				    [=](sycl::nd_item<2>) {
+				        // Inline simple GEMM (no allreduce)
+				        auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
+				        auto wg_m_ = int(item.get_group(1));
+				        auto wg_n_ = int(item.get_group(0));
+				        auto lid = int(item.get_local_id(0));
+
+				        Tensor cA_ = make_identity_tensor(A_ref.shape());
+				        Tensor cB_ = make_identity_tensor(B_ref.shape());
+				        Tensor cC_ = make_identity_tensor(C_ref.shape());
+
+				        auto wg_tile_ = mma.tile_mnk();
+				        auto wg_coord_ = make_coord(wg_m_, wg_n_, 0);
+
+				        Tensor gA_ = local_tile(cA_, select<0, 2>(wg_tile_), make_coord(wg_m_, _));
+				        Tensor gB_ = local_tile(cB_, select<1, 2>(wg_tile_), make_coord(wg_n_, _));
+				        Tensor gC_ = local_tile(cC_, wg_tile_, wg_coord_, Step<_1, _1, X>{});
+
+				        auto copy_a_ = make_block_2d_copy_A(mma, A_ref);
+				        auto copy_b_ = make_block_2d_copy_B(mma, B_ref);
+				        auto copy_c_ = make_block_2d_copy_D(mma, C_ref);
+
+				        auto thr_mma_ = mma.get_slice(lid);
+				        auto thr_ca_ = copy_a_.get_slice(lid);
+				        auto thr_cb_ = copy_b_.get_slice(lid);
+
+				        auto tCrA_ = thr_mma_.partition_sg_fragment_A(gA_(_, _, 0));
+				        auto tCrB_ = thr_mma_.partition_sg_fragment_B(gB_(_, _, 0));
+				        auto tArA_ = thr_ca_.partition_sg_fragment_D(gA_(_, _, 0));
+				        auto tBrB_ = thr_cb_.partition_sg_fragment_D(gB_(_, _, 0));
+				        Tensor tAgA_ = thr_ca_.partition_S(gA_);
+				        Tensor tBgB_ = thr_cb_.partition_S(gB_);
+				        Tensor tCrC_ = partition_fragment_C(mma, select<0, 1>(wg_tile_));
+				        Tensor tCgC_ = thr_mma_.partition_C(gC_);
+
+				        auto pfa = make_block_2d_prefetch(copy_a_);
+				        auto pfb = make_block_2d_prefetch(copy_b_);
+				        auto tpA = pfa.get_slice(lid);
+				        auto tpB = pfb.get_slice(lid);
+				        auto pAgA_ = tpA.partition_S(gA_);
+				        auto pBgB_ = tpB.partition_S(gB_);
+
+				        int k_tiles = ceil_div(shape<1>(A_ref), get<2>(wg_tile_));
+				        int kp = 0;
+				        clear(tCrC_);
+				        CUTE_UNROLL
+				        for (; kp < 3; kp++) {
+				            prefetch(pfa, pAgA_(_, _, _, kp));
+				            prefetch(pfb, pBgB_(_, _, _, kp));
+				        }
+				        for (int kt = 0; kt < k_tiles; kt++, kp++) {
+				            barrier_arrive(2);
+				            copy(copy_a_, tAgA_(_, _, _, kt), tArA_);
+				            copy(copy_b_, tBgB_(_, _, _, kt), tBrB_);
+				            prefetch(pfa, pAgA_(_, _, _, kp));
+				            prefetch(pfb, pBgB_(_, _, _, kp));
+				            reorder(tArA_, tCrA_);
+				            reorder(tBrB_, tCrB_);
+				            gemm(mma, tCrA_, tCrB_, tCrC_);
+				            barrier_wait(2);
+				        }
+				        auto a_elem = static_cast<ElementC>(a);
+				        for (int i = 0; i < size(tCrC_); ++i) { tCrC_(i) = tCrC_(i) * a_elem; }
+				        copy(copy_c_, tCrC_, tCgC_);
+				    });
+			});
 		}
 		q.wait();
 
-		// Step 2: Copy full GEMM result to host and convert to float for MPI
-		std::vector<ElementOutput> host_full_raw(full_c_elems);
-		q.memcpy(host_full_raw.data(), d_full, full_c_elems * sizeof(ElementOutput)).wait();
-		sycl::free(d_full, q);
+		// Copy to host for MPI_Allreduce
+		std::vector<ElementC> host_ref_raw(c_elems);
+		q.memcpy(host_ref_raw.data(), d_ref, c_elems * sizeof(ElementC)).wait();
+		sycl::free(d_ref, q);
 
-		std::vector<float> host_full_f32(full_c_elems);
-		for (size_t i = 0; i < full_c_elems; ++i) {
-			host_full_f32[i] = static_cast<float>(host_full_raw[i]);
+		std::vector<float> host_ref_f32(c_elems);
+		for (size_t i = 0; i < c_elems; ++i) {
+			host_ref_f32[i] = static_cast<float>(host_ref_raw[i]);
 		}
+		std::vector<float> host_expected(c_elems);
+		MPI_Allreduce(host_ref_f32.data(), host_expected.data(),
+		              static_cast<int>(c_elems), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
 
-		// Step 3: MPI_Reduce_scatter to get reference for this rank's shard (in float)
-		std::vector<float> host_ref(shard_c_elems);
-		std::vector<int> recvcounts(world_size, static_cast<int>(shard_c_elems));
-		MPI_Reduce_scatter(host_full_f32.data(), host_ref.data(), recvcounts.data(),
-		                   MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+		// Run fused kernel
+		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
+		auto A_t = make_tensor(make_gmem_ptr(block_A),
+		    make_layout(make_shape(m, k), make_stride(k, Int<1>{})));
+		auto B_t = make_tensor(make_gmem_ptr(block_B),
+		    make_layout(make_shape(n, k), make_stride(Int<1>{}, n)));
+		auto C_t = make_tensor(make_gmem_ptr(local_p2p),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
+		auto D_t = make_tensor(make_gmem_ptr(block_D),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
 
-		// Step 4: Run one reduce_scatter iteration on GPU
-		q.memset(block_C, 0, full_c_elems * sizeof(ElementOutput)).wait();
+		q.memset(block_D, 0, c_elems * sizeof(ElementC)).wait();
 		MPI_Barrier(MPI_COMM_WORLD);
-		run_iteration(q, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+		run_fused(A_t, B_t, C_t, D_t, options.alpha, rank, world_size, m, n);
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
-		// Step 5: Copy GPU result (this rank's shard from block_C) to host
-		std::vector<ElementOutput> host_result(shard_c_elems);
-		size_t local_off = static_cast<size_t>(rank) * shard_c_elems;
-		q.memcpy(host_result.data(), block_C + local_off, shard_c_elems * sizeof(ElementOutput)).wait();
+		// Compare
+		std::vector<ElementC> host_result(c_elems);
+		q.memcpy(host_result.data(), block_D, c_elems * sizeof(ElementC)).wait();
 
-		// Step 6: Compare
-		double max_abs_diff = 0.0;
-		double max_rel_diff = 0.0;
+		double max_abs_diff = 0.0, max_rel_diff = 0.0;
 		size_t mismatch_count = 0;
-		for (size_t i = 0; i < shard_c_elems; ++i) {
-			double ref = static_cast<double>(host_ref[i]);
-			double val = static_cast<double>(host_result[i]);
+		for (size_t i = 0; i < c_elems; ++i) {
+			double ref = static_cast<double>(host_expected[i]);
+			double val = static_cast<double>(static_cast<float>(host_result[i]));
 			double diff = std::abs(ref - val);
 			double rel = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
 			max_abs_diff = std::max(max_abs_diff, diff);
@@ -455,122 +338,115 @@ struct ExampleRunner {
 		bool passed = (mismatch_count == 0);
 		printf("[rank %d] Verification %s: max_abs=%.6e, max_rel=%.6e, mismatches=%zu/%zu (expected=%.3f)\n",
 		       rank, passed ? "PASSED" : "FAILED",
-		       max_abs_diff, max_rel_diff, mismatch_count, shard_c_elems,
-		       static_cast<double>(host_ref[0]));
+		       max_abs_diff, max_rel_diff, mismatch_count, c_elems,
+		       host_expected[0]);
 		return passed;
 	}
 
 	cutlass::Status run(
 			Options const& options,
-			cutlass::KernelHardwareInfo const& hw_info,
 			sycl::device const& device,
 			int rank,
 			int world_size) {
 
-		if (options.m % world_size != 0) {
-			throw std::runtime_error("GEMM+reduce-scatter requires M divisible by world_size.");
-		}
-
-		size_t a_elems = static_cast<size_t>(options.m) * options.k * options.l;
-		size_t b_elems = static_cast<size_t>(options.n) * options.k * options.l;
-		size_t c_elems = static_cast<size_t>(options.m) * options.n * options.l;
+		int m = options.m, n = options.n, k = options.k;
+		size_t a_elems = static_cast<size_t>(m) * k;
+		size_t b_elems = static_cast<size_t>(n) * k;
+		size_t c_elems = static_cast<size_t>(m) * n;
 		if (a_elems == 0 || b_elems == 0 || c_elems == 0) {
-			throw std::runtime_error("Invalid zero-sized allocation request. Check m/n/k/world_size values.");
-		}
-		if (!device.get_info<sycl::info::device::usm_device_allocations>()) {
-			throw std::runtime_error("Selected SYCL device does not support USM device allocations.");
+			throw std::runtime_error("Invalid zero-sized allocation.");
 		}
 
-		if (!current_q_) {
-			auto queue_context = sycl::context(device);
-			current_q_ = std::make_unique<sycl::queue>(
-					queue_context,
-					device,
-					sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}});
+		if (!q_) {
+			auto ctx = sycl::context(device);
+			q_ = std::make_unique<sycl::queue>(
+			    ctx, device,
+			    sycl::property_list{sycl::property::queue::in_order{},
+			                        sycl::property::queue::enable_profiling{}});
 		}
 
-		ElementA* block_A = sycl::malloc_device<ElementA>(a_elems, *current_q_);
-		ElementB* block_B = sycl::malloc_device<ElementB>(b_elems, *current_q_);
-		ElementOutput* block_C = sycl::malloc_device<ElementOutput>(c_elems, *current_q_);
+		if (!symm_) {
+			symm_ = std::make_unique<SymmMemory>(m, n, k, rank, world_size, *q_, 8);
+		}
+
+		ElementA* block_A = sycl::malloc_device<ElementA>(a_elems, *q_);
+		ElementB* block_B = sycl::malloc_device<ElementB>(b_elems, *q_);
+		ElementC* block_D = sycl::malloc_device<ElementC>(c_elems, *q_);
+
+		q_->memset(block_A, 0, a_elems * sizeof(ElementA)).wait();
+		q_->memset(block_B, 0, b_elems * sizeof(ElementB)).wait();
+		q_->memset(block_D, 0, c_elems * sizeof(ElementC)).wait();
+
 		auto mb = [](size_t bytes) {
 			return static_cast<double>(bytes) / (1024.0 * 1024.0);
 		};
-		printf("[rank %d] Allocated: A=%.2f MiB, B=%.2f MiB, C=%.2f MiB\n",
-				rank,
-				mb(a_elems * sizeof(ElementA)),
-				mb(b_elems * sizeof(ElementB)),
-				mb(c_elems * sizeof(ElementOutput)));
-		if (block_A == nullptr || block_B == nullptr || block_C == nullptr) {
-			throw std::runtime_error(
-				"Device allocation failed: A=" + std::to_string(mb(a_elems * sizeof(ElementA))) +
-				" MiB, B=" + std::to_string(mb(b_elems * sizeof(ElementB))) +
-				" MiB, C=" + std::to_string(mb(c_elems * sizeof(ElementOutput))) + " MiB.");
-		}
+		printf("[rank %d] Allocated: A=%.2f MiB, B=%.2f MiB, D=%.2f MiB\n",
+		       rank,
+		       mb(a_elems * sizeof(ElementA)),
+		       mb(b_elems * sizeof(ElementB)),
+		       mb(c_elems * sizeof(ElementC)));
 
 		auto cleanup = [&]() {
-			if (block_A) sycl::free(block_A, *current_q_);
-			if (block_B) sycl::free(block_B, *current_q_);
-			if (block_C) sycl::free(block_C, *current_q_);
+			release_tile_signals();
+			if (block_A) sycl::free(block_A, *q_);
+			if (block_B) sycl::free(block_B, *q_);
+			if (block_D) sycl::free(block_D, *q_);
 		};
 
-		initialize(block_A, block_B, block_C, options, hw_info, device, rank, world_size);
+		// Build cute tensors (reused for all iterations)
+		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
+		auto A = make_tensor(make_gmem_ptr(block_A),
+		    make_layout(make_shape(m, k), make_stride(k, Int<1>{})));
+		auto B = make_tensor(make_gmem_ptr(block_B),
+		    make_layout(make_shape(n, k), make_stride(Int<1>{}, n)));
+		auto C = make_tensor(make_gmem_ptr(local_p2p),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
+		auto D = make_tensor(make_gmem_ptr(block_D),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
+
+		// Initialize tile-level IPC signals
+		initialize_tile_signals(m, n, rank, world_size, A, B, C);
 		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 
-		// verification
-		if (options.verify != 0 && !verify(block_A, block_B, block_C, options, hw_info, rank, world_size)) {
+		// Verification
+		if (options.verify != 0 && !verify(block_A, block_B, block_D, options, rank, world_size)) {
 			std::cerr << "[rank " << rank << "] verification failed!" << std::endl;
 			cleanup();
 			return cutlass::Status::kErrorInternal;
 		}
 		MPI_Barrier(MPI_COMM_WORLD);
 
-		// warmup
+		// Warmup
 		constexpr int kWarmupIters = 10;
 		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
-			run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
+			run_fused(A, B, C, D, options.alpha, rank, world_size, m, n);
 		}
-
-		current_q_->wait();
-		MPI_Barrier(MPI_COMM_WORLD); // ensure all ranks have finished warmup before starting benchmark iterations
+		q_->wait();
+		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] warmup done" << std::endl;
 
-		// benchmark
-		sycl::event ev_before;
+		// Benchmark
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			if (iter == 1) {
-				ev_before = run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
-			} else {
-				run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
-			}
+			run_fused(A, B, C, D, options.alpha, rank, world_size, m, n);
 		}
+		auto ev_after = q_->ext_oneapi_submit_barrier();
+		q_->wait();
 		auto benchmark_stop = std::chrono::high_resolution_clock::now();
-		auto ev_after = current_q_->ext_oneapi_submit_barrier();
-		current_q_->wait();
 
 		MPI_Barrier(MPI_COMM_WORLD);
 
 		double total_ms = std::chrono::duration<double, std::milli>(benchmark_stop - benchmark_start).count();
-		auto dev_start_ns = ev_before.get_profiling_info<sycl::info::event_profiling::command_end>();
-		auto dev_end_ns   = ev_after.get_profiling_info<sycl::info::event_profiling::command_start>();
-		double total_device_ms = static_cast<double>(dev_end_ns - dev_start_ns) / 1e6;
-
-		if (true) {
-			double avg_ms = total_ms / options.iterations;
-			double avg_device_ms = total_device_ms / (options.iterations - 2);
-			int local_rows = options.m / world_size;
-			double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
-			std::cout << "[" << rank << "] Problem Size: " << options.m << 'x' << options.n << 'x' << options.k
-			          << 'x' << options.l << ", TP=" << world_size << std::endl;
-			printf("[%d] GEMM shard per call: M=%d N=%d K=%d\n", rank, local_rows, options.n, options.k);
-			printf("[%d] Pipelined GEMM + Reduce-Scatter (host):   [%4.3f]TFlop/s  (%6.4f)ms\n", rank, tflops / (avg_ms / 1000.0), avg_ms);
-			printf("[%d] Pipelined GEMM + Reduce-Scatter (device): [%4.3f]TFlop/s  (%6.4f)ms\n", rank, tflops / (avg_device_ms / 1000.0), avg_device_ms);
-		}
+		double avg_ms = total_ms / options.iterations;
+		double tflops = (2.0 * m * n * k) * 1e-12;
+		std::cout << "[" << rank << "] Problem Size: " << m << 'x' << n << 'x' << k
+		          << ", TP=" << world_size << std::endl;
+		printf("[%d] GEMM + Allreduce (host): [%4.3f]TFlop/s  (%6.4f)ms\n",
+		       rank, tflops / (avg_ms / 1000.0), avg_ms);
 
 		cleanup();
-
 		return cutlass::Status::kSuccess;
 	}
 };
@@ -598,90 +474,22 @@ int main(int argc, char** argv) {
 
 	auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
 	if (devices.empty()) {
-		if (rank == 0) {
-			std::cerr << "No GPU devices found" << std::endl;
-		}
+		if (rank == 0) std::cerr << "No GPU devices found" << std::endl;
 		MPI_Finalize();
 		return 1;
 	}
 	if (static_cast<size_t>(rank) >= devices.size()) {
 		std::cerr << "Rank " << rank << " requires GPU device[" << rank << "], but only "
-						<< devices.size() << " devices are available" << std::endl;
+		          << devices.size() << " devices are available" << std::endl;
 		MPI_Finalize();
 		return 1;
 	}
 
 	auto device = devices[rank];
 
-	cutlass::KernelHardwareInfo hw_info;
-	hw_info.device_id = rank;
-	hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
-
-	using ElementAccumulator = float;
-	using ElementComputeEpilogue = float;
-	using ElementInputA = bfloat16_t;
-	using ElementInputB = bfloat16_t;
-	using ElementOutput = bfloat16_t;
-
-	using LayoutA = cutlass::layout::RowMajor;
-	using LayoutB = cutlass::layout::RowMajor;
-	using LayoutC = cutlass::layout::RowMajor;
-	using LayoutD = cutlass::layout::RowMajor;
-
-	using GmemTiledCopyA = void;
-	using GmemTiledCopyB = void;
-	using TileShape = Shape<_256, _256, _32>;
-	using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>, Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
-	constexpr int PipelineStages = 2;
-	using GEMMDispatchPolicy = cutlass::gemm::MainloopXeL1Staged<PipelineStages>;
-	using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGeneric;
-	using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
-			ElementOutput,
-			ElementComputeEpilogue,
-			ElementAccumulator,
-			ElementAccumulator,
-			cutlass::FloatRoundStyle::round_to_nearest>;
-	using FusionCallbacks = cutlass::epilogue::fusion::FusionCallbacks<
-			EpilogueDispatchPolicy,
-			EpilogueOp,
-			TileShape,
-			decltype(tile_shape(TiledMma()))>;
-	using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
-			EpilogueDispatchPolicy,
-			TileShape,
-			void,
-			ElementAccumulator,
-			cutlass::gemm::TagToStrideC_t<LayoutC>,
-			ElementOutput,
-			cutlass::gemm::TagToStrideC_t<LayoutD>,
-			FusionCallbacks,
-			void,
-			void>;
-	using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-			GEMMDispatchPolicy,
-			TileShape,
-			ElementInputA,
-			cutlass::gemm::TagToStrideA_t<LayoutA>,
-			ElementInputB,
-			cutlass::gemm::TagToStrideB_t<LayoutB>,
-			TiledMma,
-			GmemTiledCopyA,
-			void,
-			void,
-			cute::identity,
-			GmemTiledCopyB,
-			void,
-			void,
-			cute::identity>;
-	using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-			Shape<int, int, int, int>,
-			CollectiveMainloop,
-			CollectiveEpilogue>;
-	using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-	ExampleRunner<Gemm> runner;
+	ExampleRunner runner;
 	try {
-		CUTLASS_CHECK(runner.run(options, hw_info, device, rank, world_size));
+		CUTLASS_CHECK(runner.run(options, device, rank, world_size));
 	} catch (std::exception const& e) {
 		std::cerr << "[rank " << rank << "] " << e.what() << std::endl;
 		MPI_Abort(MPI_COMM_WORLD, 1);

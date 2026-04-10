@@ -146,9 +146,10 @@ struct ExampleRunner {
 
 		if (!symm_) {
 			log_init("creating SymmMemory");
-			// Pass global M so symm buffer = world_size * M * N * 2 bytes,
-			// large enough for world_size slots of (local_rows * N) floats.
-			symm_ = std::make_unique<SymmMemory>(options.m, options.n, options.k, rank, world_size, *current_q_, 8);
+			// world_size slots of (local_rows * N * L) bf16 elements = M * N * L total
+			size_t rs_data_elems = static_cast<size_t>(options.m) * options.n * options.l;
+			symm_ = std::make_unique<SymmMemory>(options.m, options.n, options.k, rank, world_size, *current_q_, 8,
+					rs_data_elems);
 			log_init("SymmMemory created");
 		}
 
@@ -542,7 +543,7 @@ struct ExampleRunner {
 		sycl::event ev_before;
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			if (iter == 1) {
+			if (iter == 9) {
 				ev_before = run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
 			} else {
 				run_iteration(*current_q_, block_A, block_B, block_C, *symm_, options, hw_info, rank, world_size);
@@ -561,7 +562,7 @@ struct ExampleRunner {
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
-			double avg_device_ms = total_device_ms / (options.iterations - 2);
+			double avg_device_ms = total_device_ms / (options.iterations - 10);
 			int local_rows = options.m / world_size;
 			double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
 			std::cout << "[" << rank << "] Problem Size: " << options.m << 'x' << options.n << 'x' << options.k

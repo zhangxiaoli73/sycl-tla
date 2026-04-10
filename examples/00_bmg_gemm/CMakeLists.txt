@@ -173,3 +173,22 @@ cutlass_example_add_executable(
   test_local_reduction
   test_local_reduction.cpp
 )
+
+cutlass_example_add_executable(
+  00_bmg_gemm_allreduce
+  00_bmg_gemm_allreduce.cpp
+)
+
+target_include_directories(
+  00_bmg_gemm_allreduce
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
+target_link_libraries(
+  00_bmg_gemm_allreduce
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)

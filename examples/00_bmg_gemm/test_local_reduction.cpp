@@ -33,7 +33,6 @@ constexpr int BENCH_ITERS  = 50;
 // ── Templatized kernel (NUM_PER_TH as template param) ───────────────────────
 template <int NUM_PER_TH>
 struct ReductionKernel;   // kernel name tag
-
 // NUM_PER_TH = number of int64_t loads per work-item
 // Each int64_t = 4 bf16, so each work-item processes NUM_PER_TH * 4 bf16 elements
 template <int NUM_PER_TH>
@@ -45,19 +44,22 @@ sycl::event launch_local_reduction(
 		const BF16* buf3_ptr,
 		BF16* out_ptr,
 		int64_t n_elems) {
-
 	constexpr int BF16_PER_I64 = 4;  // 64bit / 16bit
-	const int WG_SIZE = static_cast<int>(q.get_device().get_info<sycl::info::device::max_work_group_size>())/NUM_PER_TH;
+	constexpr int BF16_VEC_SIZE = NUM_PER_TH * BF16_PER_I64;  // total bf16 per work-item
+	static_assert(BF16_VEC_SIZE <= 16, "NUM_PER_TH * 4 must be <= 16 for sycl::vec");
+
+	const int WG_SIZE = static_cast<int>(
+		q.get_device().get_info<sycl::info::device::max_work_group_size>()) / NUM_PER_TH;
 
 	const int64_t i64_elems = n_elems / BF16_PER_I64;
-	const int64_t TILE_SIZE = static_cast<int64_t>(WG_SIZE) * NUM_PER_TH;
-	const int64_t n_groups = (i64_elems + TILE_SIZE - 1) / TILE_SIZE;
+	const int64_t vec_elems = i64_elems / NUM_PER_TH;
+	const int64_t n_groups = (vec_elems + WG_SIZE - 1) / WG_SIZE;
 
-	auto out_i64 = reinterpret_cast<int64_t*>(out_ptr);
-	auto b0 = reinterpret_cast<const int64_t*>(buf0_ptr);
-	auto b1 = reinterpret_cast<const int64_t*>(buf1_ptr);
-	auto b2 = reinterpret_cast<const int64_t*>(buf2_ptr);
-	auto b3 = reinterpret_cast<const int64_t*>(buf3_ptr);
+	auto out_i64 = reinterpret_cast<sycl::vec<int64_t, NUM_PER_TH>*>(out_ptr);
+	auto b0 = reinterpret_cast<const sycl::vec<int64_t, NUM_PER_TH>*>(buf0_ptr);
+	auto b1 = reinterpret_cast<const sycl::vec<int64_t, NUM_PER_TH>*>(buf1_ptr);
+	auto b2 = reinterpret_cast<const sycl::vec<int64_t, NUM_PER_TH>*>(buf2_ptr);
+	auto b3 = reinterpret_cast<const sycl::vec<int64_t, NUM_PER_TH>*>(buf3_ptr);
 
 	return q.submit([&](sycl::handler& h) {
 		h.parallel_for<ReductionKernel<NUM_PER_TH>>(
@@ -66,37 +68,22 @@ sycl::event launch_local_reduction(
 				sycl::range<1>(WG_SIZE)),
 			[=](sycl::nd_item<1> item)
 			[[sycl::reqd_sub_group_size(16)]] {
-				const int64_t wi_base = static_cast<int64_t>(item.get_global_linear_id()) * NUM_PER_TH;
+				const int64_t vec_idx = static_cast<int64_t>(item.get_global_linear_id());
+				if (vec_idx >= vec_elems) return;
 
-				for (int v = 0; v < NUM_PER_TH; ++v) {
-					const int64_t idx = wi_base + v;
-					if (idx >= i64_elems) break;
+				// 64-bit wide load: NUM_PER_TH int64s from each buffer
+				sycl::vec<int64_t, NUM_PER_TH> raw0 = b0[vec_idx];
+				sycl::vec<int64_t, NUM_PER_TH> raw1 = b1[vec_idx];
+				sycl::vec<int64_t, NUM_PER_TH> raw2 = b2[vec_idx];
+				sycl::vec<int64_t, NUM_PER_TH> raw3 = b3[vec_idx];
 
-					// 64-bit load from each buffer
-					int64_t raw0 = b0[idx];
-					int64_t raw1 = b1[idx];
-					int64_t raw2 = b2[idx];
-					int64_t raw3 = b3[idx];
+				// .as<>() reinterpret int64 → BF16, vec add, reinterpret back
+				auto sum = raw0.template as<sycl::vec<BF16, BF16_VEC_SIZE>>();
+				sum += raw1.template as<sycl::vec<BF16, BF16_VEC_SIZE>>();
+				sum += raw2.template as<sycl::vec<BF16, BF16_VEC_SIZE>>();
+				sum += raw3.template as<sycl::vec<BF16, BF16_VEC_SIZE>>();
 
-					// Unpack 4 bf16, sum in float, repack
-					int64_t result = 0;
-					for (int k = 0; k < BF16_PER_I64; ++k) {
-						int shift = k * 16;
-						uint16_t h0 = static_cast<uint16_t>((raw0 >> shift) & 0xFFFF);
-						uint16_t h1 = static_cast<uint16_t>((raw1 >> shift) & 0xFFFF);
-						uint16_t h2 = static_cast<uint16_t>((raw2 >> shift) & 0xFFFF);
-						uint16_t h3 = static_cast<uint16_t>((raw3 >> shift) & 0xFFFF);
-						BF16 f0 = sycl::bit_cast<BF16>(h0);
-						BF16 f1 = sycl::bit_cast<BF16>(h1);
-						BF16 f2 = sycl::bit_cast<BF16>(h2);
-						BF16 f3 = sycl::bit_cast<BF16>(h3);
-						BF16 sum = static_cast<BF16>(
-							float(f0) + float(f1) + float(f2) + float(f3));
-						uint16_t packed = sycl::bit_cast<uint16_t>(sum);
-						result |= (static_cast<int64_t>(packed) << shift);
-					}
-					out_i64[idx] = result;
-				}
+				out_i64[vec_idx] = sum.template as<sycl::vec<int64_t, NUM_PER_TH>>();
 			});
 	});
 }
@@ -211,11 +198,10 @@ int main() {
 
 	printf("\n── Correctness + Benchmark (sweep NUM_PER_TH) ──\n");
 	bool all_passed = true;
-	all_passed &= run_variant<1>(q, d_bufs, d_out, h_bf16_bufs);
-	all_passed &= run_variant<2>(q, d_bufs, d_out, h_bf16_bufs);
-	all_passed &= run_variant<4>(q, d_bufs, d_out, h_bf16_bufs);
-	all_passed &= run_variant<8>(q, d_bufs, d_out, h_bf16_bufs);
-	all_passed &= run_variant<16>(q, d_bufs, d_out, h_bf16_bufs);
+	// NUM_PER_TH * 4 must be <= 16 (sycl::vec max size)
+	all_passed &= run_variant<1>(q, d_bufs, d_out, h_bf16_bufs);   // 1 int64 =  4 bf16 =  8B
+	all_passed &= run_variant<2>(q, d_bufs, d_out, h_bf16_bufs);   // 2 int64 =  8 bf16 = 16B
+	all_passed &= run_variant<4>(q, d_bufs, d_out, h_bf16_bufs);   // 4 int64 = 16 bf16 = 32B
 
 	// Cleanup
 	for (int b = 0; b < NUM_BUFS; ++b)

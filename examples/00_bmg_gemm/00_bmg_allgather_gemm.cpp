@@ -138,7 +138,9 @@ struct ExampleRunner {
 
 		if (!symm_) {
 			log_init("creating SymmMemory");
-			symm_ = std::make_unique<SymmMemory>(local_m, n, k, rank, world_size, *current_q_, 8);
+			size_t allgather_data_elems = static_cast<size_t>(local_m) * k * world_size;
+			symm_ = std::make_unique<SymmMemory>(local_m, n, k, rank, world_size, *current_q_, 8,
+					allgather_data_elems);
 			if (options.debug_log) {
 				std::cout << "[rank " << rank << "] SymmMemory initialized" << std::endl;
 			}
@@ -592,7 +594,7 @@ struct ExampleRunner {
 		sycl::event ev_before;
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			if (iter == 1) {
+			if (iter == 9) {
 				if (options.gemm_only != 0) {
 					ev_before = run_iteration_gemm_only(*current_q_, full_A, B, final_C, options, hw_info, ctx, device, rank, world_size);
 				} else {
@@ -620,7 +622,7 @@ struct ExampleRunner {
 
 		if (true) {
 			double avg_ms = total_ms / options.iterations;
-			double avg_device_ms = total_device_ms / (options.iterations - 2);
+			double avg_device_ms = total_device_ms / (options.iterations - 10);
 			double tflops = (2.0 * options.m * options.n * options.k) * 1e-12;
 			const char* label = (options.gemm_only != 0) ? "GEMM only" : "Pipelined allgather+GEMM";
 			std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k

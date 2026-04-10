@@ -156,7 +156,10 @@ inline bool try_wait_signal_device(uint32_t* addr, size_t max_iterations = 10000
 
 class SymmMemory {
  public:
-  SymmMemory(int m, int n, int k, int rank, int world_size, sycl::queue& q, int num_channels = 1024)
+  SymmMemory(int m, int n, int k, int rank, int world_size, sycl::queue& q,
+             int num_channels = 1024,
+             size_t override_data_elems = 0,
+             size_t override_signal_elems = 0)
       : m_(m),
         n_(n),
         k_(k),
@@ -165,10 +168,14 @@ class SymmMemory {
         num_channels_(num_channels),
         init_q_(q),
         local_epoch_(num_channels, 0) {
-      // Data buffer layout for allgathered A shards: [world_size][m][k].
-      // `m` here is local_m from caller, so total elements are world_size * local_m * k.
-    size_t data_elems = static_cast<size_t>(m) * k * world_size_; // 16-bit elements
-    size_t signal_elems = static_cast<size_t>(world_size_);
+    // Data buffer: default [m][n] bf16 elements, or caller-specified count
+    size_t data_elems = (override_data_elems > 0)
+        ? override_data_elems
+        : static_cast<size_t>(m) * n;
+    // Signal buffer: default world_size uint32_t elements, or caller-specified count
+    size_t signal_elems = (override_signal_elems > 0)
+        ? override_signal_elems
+        : static_cast<size_t>(world_size_);
 
     size_t data_elems_bytes = data_elems * 2; // 16-bit elements
     size_t signal_elems_bytes = signal_elems * sizeof(uint32_t);
@@ -208,6 +215,13 @@ class SymmMemory {
       host_pads[i] = reinterpret_cast<uint32_t*>(remote_signal_ptrs_[i]);
     }
     init_q_.memcpy(remote_signal_ptrs_dev_, host_pads.data(), world_size_ * sizeof(uint32_t*)).wait();
+
+    // Allocate device buffer and copy remote data pointers for allreduce kernel
+    remote_data_ptrs_dev_ = static_cast<void**>(sycl::malloc_device(world_size_ * sizeof(void*), init_q_));
+    if (remote_data_ptrs_dev_ == nullptr) {
+      throw std::runtime_error("SymmMemory: failed to allocate remote_data_ptrs_dev_");
+    }
+    init_q_.memcpy(remote_data_ptrs_dev_, remote_data_ptrs_.data(), world_size_ * sizeof(void*)).wait();
 
     // make remote IPC memory resident on local device
     auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(init_q_.get_context());
@@ -250,6 +264,10 @@ class SymmMemory {
     if (remote_signal_ptrs_dev_) {
       sycl::free(remote_signal_ptrs_dev_, init_q_);
       remote_signal_ptrs_dev_ = nullptr;
+    }
+    if (remote_data_ptrs_dev_) {
+      sycl::free(remote_data_ptrs_dev_, init_q_);
+      remote_data_ptrs_dev_ = nullptr;
     }
     if (local_signal_ptr_) {
       sycl::free(local_signal_ptr_, init_q_);
@@ -326,6 +344,7 @@ class SymmMemory {
   void* local_data_ptr_ = nullptr;
   std::vector<void*> remote_data_ptrs_;
   uint32_t** remote_signal_ptrs_dev_ = nullptr;  // device buffer holding signal pad pointers
+  void** remote_data_ptrs_dev_ = nullptr;         // device buffer holding data pointers for allreduce
 
 
  private:
