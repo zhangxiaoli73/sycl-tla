@@ -1,0 +1,55 @@
+# GEMM Allgather & Reducescatter Test Configurations
+# TP=4 for all configurations
+# M values: 8192, 4096, 2048, 1024
+
+# ============================================================
+# A16W16 - Allgather + Matmul
+# ============================================================
+Pattern: A16W16_Allgather    M=8192  N=1536   K=4096   TP=4
+Pattern: A16W16_Allgather    M=4096  N=1536   K=4096   TP=4
+Pattern: A16W16_Allgather    M=2048  N=1536   K=4096   TP=4
+Pattern: A16W16_Allgather    M=1024  N=1536   K=4096   TP=4
+
+Pattern: A16W16_Allgather    M=8192  N=7168   K=4096   TP=4
+Pattern: A16W16_Allgather    M=4096  N=7168   K=4096   TP=4
+Pattern: A16W16_Allgather    M=2048  N=7168   K=4096   TP=4
+Pattern: A16W16_Allgather    M=1024  N=7168   K=4096   TP=4
+
+# ============================================================
+# A16W16 - Matmul + Reducescatter
+# ============================================================
+Pattern: A16W16_Reducescatter    M=8192  N=4096   K=1024   TP=4
+Pattern: A16W16_Reducescatter    M=4096  N=4096   K=1024   TP=4
+Pattern: A16W16_Reducescatter    M=2048  N=4096   K=1024   TP=4
+Pattern: A16W16_Reducescatter    M=1024  N=4096   K=1024   TP=4
+
+Pattern: A16W16_Reducescatter    M=8192  N=4096   K=3584   TP=4
+Pattern: A16W16_Reducescatter    M=4096  N=4096   K=3584   TP=4
+Pattern: A16W16_Reducescatter    M=2048  N=4096   K=3584   TP=4
+Pattern: A16W16_Reducescatter    M=1024  N=4096   K=3584   TP=4
+
+# ============================================================
+# A16W8 - Allgather + Scaled Matmul
+# ============================================================
+Pattern: A16W8_Allgather     M=8192  N=2560   K=5120   TP=4
+Pattern: A16W8_Allgather     M=4096  N=2560   K=5120   TP=4
+Pattern: A16W8_Allgather     M=2048  N=2560   K=5120   TP=4
+Pattern: A16W8_Allgather     M=1024  N=2560   K=5120   TP=4
+
+Pattern: A16W8_Allgather     M=8192  N=12800  K=5120   TP=4
+Pattern: A16W8_Allgather     M=4096  N=12800  K=5120   TP=4
+Pattern: A16W8_Allgather     M=2048  N=12800  K=5120   TP=4
+Pattern: A16W8_Allgather     M=1024  N=12800  K=5120   TP=4
+
+# ============================================================
+# A16W8 - Scaled Matmul + Reducescatter
+# ============================================================
+Pattern: A16W8_Reducescatter     M=8192  N=5120   K=2048   TP=4
+Pattern: A16W8_Reducescatter     M=4096  N=5120   K=2048   TP=4
+Pattern: A16W8_Reducescatter     M=2048  N=5120   K=2048   TP=4
+Pattern: A16W8_Reducescatter     M=1024  N=5120   K=2048   TP=4
+
+Pattern: A16W8_Reducescatter     M=8192  N=5120   K=6400   TP=4
+Pattern: A16W8_Reducescatter     M=4096  N=5120   K=6400   TP=4
+Pattern: A16W8_Reducescatter     M=2048  N=5120   K=6400   TP=4
+Pattern: A16W8_Reducescatter     M=1024  N=5120   K=6400   TP=4
