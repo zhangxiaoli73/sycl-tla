@@ -1,0 +1,71 @@
+// ---- 配置 1: Stages=3 ----
+using TileShape = Shape<_256, _128, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 2: K=64 ----
+using TileShape = Shape<_256, _128, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 2;
+
+// ---- 配置 3: K=64 + Stages=3 ----
+using TileShape = Shape<_256, _128, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 4: 128×256, 4×8 SG ----
+using TileShape = Shape<_128, _256, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 2;
+
+// ---- 配置 5: 128×256×64, 4×8 SG, Stages=3 ----
+using TileShape = Shape<_128, _256, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 6: 128×128, 4×4 SG, Stages=3 ----
+using TileShape = Shape<_128, _128, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 7: 128×256×32, 4×8, Stages=3 ----
+using TileShape = Shape<_128, _256, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 8: 128×256×64, 4×8, Stages=2 ----
+using TileShape = Shape<_128, _256, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 2;
+
+// ---- 配置 9: 128×128×64, 4×4, Stages=3 ----
+using TileShape = Shape<_128, _128, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;
+
+// ---- 配置 10: 128×128×64, 4×4, Stages=2 ----
+using TileShape = Shape<_128, _128, _64>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 2;
+
+// ---- 配置 11: 128×128×32, 4×4, Stages=2 ----
+using TileShape = Shape<_128, _128, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 2;
+
+// ---- 配置 12: 128×384×32, 4×8, Stages=3 ----
+using TileShape = Shape<_128, _384, _32>;
+using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>,
+    Layout<TileShape>, Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>>::TiledMMA;
+constexpr int PipelineStages = 3;

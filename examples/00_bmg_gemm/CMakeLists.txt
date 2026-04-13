@@ -139,6 +139,11 @@ cutlass_example_add_executable(
   symm_test.cpp
 )
 
+cutlass_example_add_executable(
+  pingpong_latency_d2d
+  pingpong_latency_d2d.cpp
+)
+
 target_include_directories(
   00_bmg_symm_test
   PRIVATE
@@ -146,8 +151,21 @@ target_include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
 )
 
+target_include_directories(
+  pingpong_latency_d2d
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+)
+
 target_link_libraries(
   00_bmg_symm_test
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)
+
+target_link_libraries(
+  pingpong_latency_d2d
   PRIVATE
   ${IMPI_LIBRARY}
   $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
