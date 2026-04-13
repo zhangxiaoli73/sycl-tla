@@ -157,8 +157,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 					__asm__ volatile ("lsc_fence.ugm.invalidate.tile\n" : : :);
 #endif
 
-					const uint32_t req = 2u * r + 1u;
-					const uint32_t rep = req + 1u;
+					const uint32_t req = 2u * r + 1u; // request value (odd)
+					const uint32_t rep = req + 1u; // reply value (even)
 					uint32_t val = 0u;
 
 					if (is_initiator) {
@@ -241,24 +241,24 @@ static double run_session(sycl::queue &q,
 						  ze_device_handle_t ze_dev,
 						  int rank) {
 	q.memset(local, 0, sizeof(PingPongPad)).wait();
-	MPI_Barrier(MPI_COMM_WORLD);
 
+	MPI_Barrier(MPI_COMM_WORLD);
 	auto evt = submit_pingpong_kernel(q, local, peer, rounds, is_initiator);
 
 	uint64_t host_ts_begin = 0;
 	uint64_t gpu_ts_begin = 0;
+	uint64_t host_ts_end = 0;
+	uint64_t gpu_ts_end = 0;
+
 	if (is_initiator) {
 		zeDeviceGetGlobalTimestamps(ze_dev, &host_ts_begin, &gpu_ts_begin);
 	}
-
 	evt.wait_and_throw();
-	MPI_Barrier(MPI_COMM_WORLD);
-
-	uint64_t host_ts_end = 0;
-	uint64_t gpu_ts_end = 0;
 	if (is_initiator) {
 		zeDeviceGetGlobalTimestamps(ze_dev, &host_ts_end, &gpu_ts_end);
 	}
+
+	MPI_Barrier(MPI_COMM_WORLD);
 
 	uint32_t final_local_ctr = 0;
 	uint32_t final_local_done = 0;
