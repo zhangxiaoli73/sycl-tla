@@ -106,6 +106,10 @@ struct GemmAllreduceParams {
 
   // Mode selection
   bool use_push_mode;         // true=push, false=pull
+
+  // Monotonic per-launch token for flag synchronization.
+  // Producer writes signal_token; consumer waits for exact match.
+  uint32_t signal_token;
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -350,12 +354,12 @@ void gemm_and_push(
     if (params.use_push_mode) {
       // Push mode: set flag on every peer's flag buffer
       for (int peer = 0; peer < params.world_size; ++peer) {
-        params.remote_flags_dev[peer][flag_idx] = 1;
+        params.remote_flags_dev[peer][flag_idx] = params.signal_token;
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
       }
     } else {
       // Pull mode: set flag on local flag buffer only
-      params.local_flags[flag_idx] = 1;
+      params.local_flags[flag_idx] = params.signal_token;
       sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
     }
   }
@@ -402,7 +406,7 @@ inline void reducer_work(
           flag_ptr = &params.remote_flags_dev[src][flag_idx];
         }
         auto flag_val = *flag_ptr;
-        while (flag_val == 0) {
+        while (flag_val != params.signal_token) {
           // spin-wait
           flag_val = *flag_ptr;
         }
@@ -454,22 +458,7 @@ inline void reducer_work(
 
     sycl::group_barrier(item.get_group());
 
-    // Step 3: Clear flags for reuse in next iteration
-    if (local_id == 0) {
-      for (int src = 0; src < params.world_size; ++src) {
-        int flag_idx = src * params.num_m_tiles * params.num_n_tiles
-                     + tile_m * params.num_n_tiles + tile_n;
-        uint32_t* flag_ptr;
-        if (params.use_push_mode) {
-          flag_ptr = &params.local_flags[flag_idx];
-        } else {
-          flag_ptr = &params.remote_flags_dev[src][flag_idx];
-        }
-        
-        *flag_ptr = 0;
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-      }
-    }
+    // No flag clear is needed with token-based synchronization.
   }
 }
 
@@ -483,6 +472,8 @@ void gemm_allreduce_device(
     float alpha,
     int** ipc_signal_ptrs,
     void** ipc_data_ptrs,
+    uint32_t signal_token,
+    bool use_push_mode,
     int rank,
     int world_size,
     int m,
@@ -512,7 +503,8 @@ void gemm_allreduce_device(
   params.remote_flags_dev = reinterpret_cast<uint32_t**>(ipc_signal_ptrs);
   params.D = reinterpret_cast<SyclBF16*>(D.data().get());
   params.ldd = stride<0>(D);
-  params.use_push_mode = true;
+  params.use_push_mode = use_push_mode;
+  params.signal_token = signal_token;
 
   gemm_and_push(A, B, C, mma, alpha, params);
   sycl::group_barrier(item.get_group());

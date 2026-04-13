@@ -27,6 +27,7 @@ struct Options {
 	int iterations = 20;
 	int debug_log = 1;
 	int verify = 0;
+	int use_push_mode = 1;
 	float alpha = 1.0f;
 
 	void parse(int argc, char **args) {
@@ -46,6 +47,7 @@ struct Options {
 		cmd.get_cmd_line_argument("iterations", iterations, 20);
 		cmd.get_cmd_line_argument("debug_log", debug_log, 1);
 		cmd.get_cmd_line_argument("verify", verify, 0);
+		cmd.get_cmd_line_argument("use_push_mode", use_push_mode, 1);
 	}
 
 	std::ostream& print_usage(std::ostream& out) const {
@@ -56,7 +58,8 @@ struct Options {
 			<< "  --alpha=<float>   alpha scaling (default 1.0)\n"
 			<< "  --iterations=<int>\n"
 			<< "  --debug_log=<int> 0/1 progress logs (default 1)\n"
-			<< "  --verify=<int>    0/1 run accuracy verification (default 0)\n\n";
+			<< "  --verify=<int>    0/1 run accuracy verification (default 0)\n"
+			<< "  --use_push_mode=<int> 1=push, 0=pull (default 1)\n\n";
 		return out;
 	}
 };
@@ -130,6 +133,8 @@ struct ExampleRunner {
 			void** ipc_data_ptrs,
 			int** ipc_signal_ptrs,
 			float alpha,
+			uint32_t signal_token,
+			bool use_push_mode,
 			int rank,
 			int world_size,
 			int m,
@@ -146,7 +151,9 @@ struct ExampleRunner {
 			    [=](sycl::nd_item<2>) {
 			        gemm_allreduce_device(A, B, C, D, mma, alpha,
 			                              ipc_signal_ptrs, ipc_data_ptrs,
-			                              rank, world_size, m, n, num_n_tiles);
+				                              signal_token,
+				                              use_push_mode,
+				                              rank, world_size, m, n, num_n_tiles);
 			    });
 		});
 	}
@@ -289,11 +296,12 @@ struct ExampleRunner {
 
 		// Run fused kernel
 		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
+		ElementC* local_slot = local_p2p + static_cast<size_t>(rank) * c_elems;
 		auto A_t = make_tensor(make_gmem_ptr(block_A),
 		    make_layout(make_shape(m, k), make_stride(k, Int<1>{})));
 		auto B_t = make_tensor(make_gmem_ptr(block_B),
 		    make_layout(make_shape(n, k), make_stride(Int<1>{}, n)));
-		auto C_t = make_tensor(make_gmem_ptr(local_p2p),
+		auto C_t = make_tensor(make_gmem_ptr(local_slot),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
 		auto D_t = make_tensor(make_gmem_ptr(block_D),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
@@ -312,7 +320,8 @@ struct ExampleRunner {
 		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
 		run_fused(A_t, B_t, C_t, D_t, mma, local, global, num_n_tiles,
 		          ipc_data_ptrs, ipc_signal_ptrs,
-		          options.alpha, rank, world_size, m, n);
+		          options.alpha, 1u, options.use_push_mode != 0,
+		          rank, world_size, m, n);
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
@@ -402,7 +411,8 @@ struct ExampleRunner {
 
 		// Build C/D tensors (reused for all iterations)
 		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
-		auto C = make_tensor(make_gmem_ptr(local_p2p),
+		ElementC* local_slot = local_p2p + static_cast<size_t>(rank) * c_elems;
+		auto C = make_tensor(make_gmem_ptr(local_slot),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
 		auto D = make_tensor(make_gmem_ptr(block_D),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
@@ -432,11 +442,18 @@ struct ExampleRunner {
 
 		// Warmup
 		constexpr int kWarmupIters = 10;
+		uint32_t signal_token = (options.verify != 0) ? 2u : 1u;
+		auto next_signal_token = [&]() {
+			uint32_t token = signal_token++;
+			if (signal_token == 0) signal_token = 1u;
+			return token;
+		};
 		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
 			          ipc_data_ptrs, ipc_signal_ptrs,
-			          options.alpha, rank, world_size, m, n);
+			          options.alpha, next_signal_token(), options.use_push_mode != 0,
+			          rank, world_size, m, n);
 		}
 		q_->wait();
 		MPI_Barrier(MPI_COMM_WORLD);
@@ -447,7 +464,8 @@ struct ExampleRunner {
 		for (int iter = 0; iter < options.iterations; ++iter) {
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
 			          ipc_data_ptrs, ipc_signal_ptrs,
-			          options.alpha, rank, world_size, m, n);
+			          options.alpha, next_signal_token(), options.use_push_mode != 0,
+			          rank, world_size, m, n);
 		}
 		auto ev_after = q_->ext_oneapi_submit_barrier();
 		q_->wait();

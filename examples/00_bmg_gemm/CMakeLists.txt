@@ -197,6 +197,11 @@ cutlass_example_add_executable(
   00_bmg_gemm_allreduce.cpp
 )
 
+cutlass_example_add_executable(
+  00_bmg_allreduce_standalone
+  00_bmg_allreduce_standalone.cpp
+)
+
 target_include_directories(
   00_bmg_gemm_allreduce
   PRIVATE
@@ -204,8 +209,22 @@ target_include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
 )
 
+target_include_directories(
+  00_bmg_allreduce_standalone
+  PRIVATE
+  ${IMPI_INCLUDE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gemm_reducescatter
+)
+
 target_link_libraries(
   00_bmg_gemm_allreduce
+  PRIVATE
+  ${IMPI_LIBRARY}
+  $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
+)
+
+target_link_libraries(
+  00_bmg_allreduce_standalone
   PRIVATE
   ${IMPI_LIBRARY}
   $<$<BOOL:${ZE_LIBRARY}>:${ZE_LIBRARY}>
