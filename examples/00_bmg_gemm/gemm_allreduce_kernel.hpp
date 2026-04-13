@@ -313,17 +313,29 @@ void gemm_and_push(
 
   if (params.use_push_mode) {
     // Push: copy tile data to every remote peer's data_slots[my_rank]
-    int64_t tile_elems = static_cast<int64_t>(tile_m) * tile_n;
+    // Copy path assumes M/N are 256-aligned in launcher checks.
+
     for (int peer = 0; peer < params.world_size; ++peer) {
       if (peer == params.my_rank) continue;
       SyclBF16* remote_slot = params.remote_data_slots_dev[peer] + slot_offset;
       SyclBF16* local_slot = params.local_data_slots + slot_offset;
-      // Flat copy: each work-item copies a portion of the tile
-      for (int64_t i = local_id; i < tile_elems; i += wg_size) {
-        int row = static_cast<int>(i / tile_n);
-        int col = static_cast<int>(i % tile_n);
-        int64_t elem_off = tile_offset + static_cast<int64_t>(row) * params.N + col;
-        remote_slot[elem_off] = local_slot[elem_off];
+      // Fast vectorized copy in row-major order (32B = 16 bf16 per transaction).
+      constexpr int NUM_PER_TH = 4;
+      constexpr int BF16_PER_VEC = NUM_PER_TH * 4;
+      using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
+
+      int vec_cols = tile_n / BF16_PER_VEC;
+      int vec_stride_n = params.N / BF16_PER_VEC;
+      int64_t tile_vec_offset = tile_offset / BF16_PER_VEC;
+      LoadVec* remote_vec = reinterpret_cast<LoadVec*>(remote_slot);
+      LoadVec* local_vec = reinterpret_cast<LoadVec*>(local_slot);
+
+      for (int row = 0; row < tile_m; ++row) {
+        int64_t row_vec_base = tile_vec_offset + static_cast<int64_t>(row) * vec_stride_n;
+        for (int vc = local_id; vc < vec_cols; vc += wg_size) {
+          int64_t vec_off = row_vec_base + vc;
+          remote_vec[vec_off] = local_vec[vec_off];
+        }
       }
     }
   }
@@ -454,7 +466,7 @@ inline void reducer_work(
           flag_ptr = &params.remote_flags_dev[src][flag_idx];
         }
         
-        *flag_ptr = 1;
+        *flag_ptr = 0;
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
       }
     }

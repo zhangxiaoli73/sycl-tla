@@ -87,47 +87,48 @@ struct ExampleRunner {
 
 	// Fused kernel IPC signal resources (tile-level)
 	int* signal_local_ = nullptr;
-	int** ipc_signal_ptrs_ = nullptr;   // device array [world_size]
 	int num_tiles_ = 0;
-	std::vector<void*> opened_signal_bases_;
 
-	void initialize_tile_signals(int m, int n, int rank, int world_size,
-	                             TensorA_t const& A, TensorB_t const& B, TensorC_t const& C) {
-		auto mma = choose_tiled_mma_ar(A, B, C);
+	void initialize_tile_signals(int m, int n, int k, int rank, int world_size,
+	                             TensorA_t const& A, TensorB_t const& B, TensorC_t const& C_meta) {
+		auto mma = choose_tiled_mma_ar(A, B, C_meta);
 		int tile_m = int(get<0>(mma.tile_mnk()));
 		int tile_n = int(get<1>(mma.tile_mnk()));
 		int num_m_tiles = int(ceil_div(m, tile_m));
 		int num_n_tiles = int(ceil_div(n, tile_n));
 		num_tiles_ = num_m_tiles * num_n_tiles;
+		size_t signal_elems = static_cast<size_t>(num_tiles_) * world_size;
 
-		signal_local_ = sycl::malloc_device<int>(num_tiles_ * world_size, *q_);
-		q_->memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
-
-		// Exchange IPC handles for signal buffer
-		std::vector<void*> host_signal_ptrs = exchange_ipc_ptrs(
-		    signal_local_, rank, world_size, *q_, opened_signal_bases_);
-
-		// Copy to device array
-		ipc_signal_ptrs_ = sycl::malloc_device<int*>(world_size, *q_);
-		std::vector<int*> host_arr(world_size);
-		for (int i = 0; i < world_size; ++i) {
-			host_arr[i] = reinterpret_cast<int*>(host_signal_ptrs[i]);
+		if (!symm_) {
+			size_t override_data_elems = static_cast<size_t>(m) * n * world_size;
+			size_t override_signal_elems = signal_elems;
+			symm_ = std::make_unique<SymmMemory>(
+			    m, n, k, rank, world_size, *q_, 8,
+			    override_data_elems, override_signal_elems);
 		}
-		q_->memcpy(ipc_signal_ptrs_, host_arr.data(), world_size * sizeof(int*)).wait();
+
+		signal_local_ = reinterpret_cast<int*>(symm_->local_signal_ptr_);
+		q_->memset(signal_local_, 0, sizeof(int) * signal_elems).wait();
 	}
 
 	void release_tile_signals() {
-		close_ipc_ptrs(*q_, opened_signal_bases_);
-		if (ipc_signal_ptrs_) { sycl::free(ipc_signal_ptrs_, *q_); ipc_signal_ptrs_ = nullptr; }
-		if (signal_local_) { sycl::free(signal_local_, *q_); signal_local_ = nullptr; }
+		signal_local_ = nullptr;
+		num_tiles_ = 0;
 	}
 
-	// Launch fused GEMM + Allreduce kernel
+	// Launch fused GEMM + Allreduce kernel using precomputed launch config
+	template <class MMAType>
 	void run_fused(
 			TensorA_t const& A,
 			TensorB_t const& B,
 			TensorC_t& C,
 			TensorD_t& D,
+			MMAType const& mma,
+			sycl::range<2> const& local,
+			sycl::range<2> const& global,
+			int num_n_tiles,
+			void** ipc_data_ptrs,
+			int** ipc_signal_ptrs,
 			float alpha,
 			int rank,
 			int world_size,
@@ -138,22 +139,6 @@ struct ExampleRunner {
 
 		syclex::properties kernel_props{syclex::sub_group_size<16>,
 		                                intelex::grf_size<256>};
-
-		auto mma = choose_tiled_mma_ar(A, B, C);
-		int tile_m = int(get<0>(mma.tile_mnk()));
-		int tile_n = int(get<1>(mma.tile_mnk()));
-		int num_n_tiles = int(ceil_div(n, tile_n));
-
-		// Reset signals before each launch
-		q_->memset(signal_local_, 0, sizeof(int) * num_tiles_ * world_size).wait();
-
-		void** ipc_data_ptrs = symm_->remote_data_ptrs_dev_;
-		int** ipc_signal_ptrs = ipc_signal_ptrs_;
-
-		sycl::range<2> local = {size(mma), 1};
-		sycl::range<2> global = {
-		    local[0] * ceil_div(n, tile_n),
-		    local[1] * ceil_div(m, tile_m)};
 
 		q_->submit([&](sycl::handler& h) {
 			h.parallel_for<GemmAllreduceKernelName<ElementA, ElementB>>(
@@ -315,7 +300,19 @@ struct ExampleRunner {
 
 		q.memset(block_D, 0, c_elems * sizeof(ElementC)).wait();
 		MPI_Barrier(MPI_COMM_WORLD);
-		run_fused(A_t, B_t, C_t, D_t, options.alpha, rank, world_size, m, n);
+		auto mma = choose_tiled_mma_ar(A_t, B_t, C_t);
+		int tile_m = int(get<0>(mma.tile_mnk()));
+		int tile_n = int(get<1>(mma.tile_mnk()));
+		int num_n_tiles = int(ceil_div(n, tile_n));
+		sycl::range<2> local = {size(mma), 1};
+		sycl::range<2> global = {
+		    local[0] * ceil_div(n, tile_n),
+		    local[1] * ceil_div(m, tile_m)};
+		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
+		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
+		run_fused(A_t, B_t, C_t, D_t, mma, local, global, num_n_tiles,
+		          ipc_data_ptrs, ipc_signal_ptrs,
+		          options.alpha, rank, world_size, m, n);
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
@@ -350,6 +347,9 @@ struct ExampleRunner {
 			int world_size) {
 
 		int m = options.m, n = options.n, k = options.k;
+		if ((m % 256) != 0 || (n % 256) != 0) {
+			throw std::runtime_error("gemm_allreduce requires M and N divisible by 256.");
+		}
 		size_t a_elems = static_cast<size_t>(m) * k;
 		size_t b_elems = static_cast<size_t>(n) * k;
 		size_t c_elems = static_cast<size_t>(m) * n;
@@ -363,10 +363,6 @@ struct ExampleRunner {
 			    ctx, device,
 			    sycl::property_list{sycl::property::queue::in_order{},
 			                        sycl::property::queue::enable_profiling{}});
-		}
-
-		if (!symm_) {
-			symm_ = std::make_unique<SymmMemory>(m, n, k, rank, world_size, *q_, 8);
 		}
 
 		ElementA* block_A = sycl::malloc_device<ElementA>(a_elems, *q_);
@@ -393,19 +389,36 @@ struct ExampleRunner {
 			if (block_D) sycl::free(block_D, *q_);
 		};
 
-		// Build cute tensors (reused for all iterations)
-		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
+		// Build A/B and a metadata-only C tensor for MMA tile selection
 		auto A = make_tensor(make_gmem_ptr(block_A),
 		    make_layout(make_shape(m, k), make_stride(k, Int<1>{})));
 		auto B = make_tensor(make_gmem_ptr(block_B),
 		    make_layout(make_shape(n, k), make_stride(Int<1>{}, n)));
+		auto C_meta = make_tensor(make_gmem_ptr(block_D),
+		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
+
+		// Initialize tile-level IPC signals and create SymmMemory (once)
+		initialize_tile_signals(m, n, k, rank, world_size, A, B, C_meta);
+
+		// Build C/D tensors (reused for all iterations)
+		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
 		auto C = make_tensor(make_gmem_ptr(local_p2p),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
 		auto D = make_tensor(make_gmem_ptr(block_D),
 		    make_layout(make_shape(m, n), make_stride(n, Int<1>{})));
 
-		// Initialize tile-level IPC signals
-		initialize_tile_signals(m, n, rank, world_size, A, B, C);
+		// Precompute fused launch config once and reuse in loops
+		auto mma = choose_tiled_mma_ar(A, B, C);
+		int tile_m = int(get<0>(mma.tile_mnk()));
+		int tile_n = int(get<1>(mma.tile_mnk()));
+		int num_n_tiles = int(ceil_div(n, tile_n));
+		sycl::range<2> local = {size(mma), 1};
+		sycl::range<2> global = {
+		    local[0] * ceil_div(n, tile_n),
+		    local[1] * ceil_div(m, tile_m)};
+		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
+		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
+
 		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
 
@@ -421,7 +434,9 @@ struct ExampleRunner {
 		constexpr int kWarmupIters = 10;
 		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
-			run_fused(A, B, C, D, options.alpha, rank, world_size, m, n);
+			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
+			          ipc_data_ptrs, ipc_signal_ptrs,
+			          options.alpha, rank, world_size, m, n);
 		}
 		q_->wait();
 		MPI_Barrier(MPI_COMM_WORLD);
@@ -430,7 +445,9 @@ struct ExampleRunner {
 		// Benchmark
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
-			run_fused(A, B, C, D, options.alpha, rank, world_size, m, n);
+			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
+			          ipc_data_ptrs, ipc_signal_ptrs,
+			          options.alpha, rank, world_size, m, n);
 		}
 		auto ev_after = q_->ext_oneapi_submit_barrier();
 		q_->wait();

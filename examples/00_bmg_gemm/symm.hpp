@@ -183,8 +183,8 @@ class SymmMemory {
     std::cout << "zl_debug start to malloc local buffer and flag, "
               << "data_elems_bytes=" << data_elems_bytes
               << " signal_elems_bytes=" << signal_elems_bytes << std::endl;
-    local_signal_ptr_ = sycl::malloc_device(signal_elems_bytes, init_q_);
-    local_data_ptr_ = sycl::malloc_device(data_elems_bytes, init_q_);
+    local_signal_ptr_ = sycl::malloc_device<uint32_t>(signal_elems, init_q_);
+    local_data_ptr_ = sycl::malloc_device<uint16_t>(data_elems, init_q_);
     if (local_signal_ptr_ == nullptr || local_data_ptr_ == nullptr) {
       throw std::runtime_error("SymmMemory: sycl::malloc_device failed. signal_ptr="
           + std::to_string(reinterpret_cast<uintptr_t>(local_signal_ptr_))
@@ -217,7 +217,7 @@ class SymmMemory {
     init_q_.memcpy(remote_signal_ptrs_dev_, host_pads.data(), world_size_ * sizeof(uint32_t*)).wait();
 
     // Allocate device buffer and copy remote data pointers for allreduce kernel
-    remote_data_ptrs_dev_ = static_cast<void**>(sycl::malloc_device(world_size_ * sizeof(void*), init_q_));
+    remote_data_ptrs_dev_ = sycl::malloc_device<void*>(world_size_, init_q_);
     if (remote_data_ptrs_dev_ == nullptr) {
       throw std::runtime_error("SymmMemory: failed to allocate remote_data_ptrs_dev_");
     }
