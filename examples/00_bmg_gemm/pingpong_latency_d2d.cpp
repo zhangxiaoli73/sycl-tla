@@ -4,7 +4,7 @@
  * This version uses SymmMemory IPC mapping so each rank can access the peer
  * GPU allocation directly from device code. The signaling path keeps the same
  * low-level pattern as pingpong_latency.cpp: lsc_load.ugm.uc.uc polling,
- * lsc_atomic_store.ugm writes, and lsc_fence ordering.
+ * lsc_store.ugm.uc.uc writes, and lsc_fence ordering.
  */
 
 #include <sycl/sycl.hpp>
@@ -21,8 +21,8 @@
 
 #include "symm.hpp"
 
-static constexpr uint32_t NUM_ROUNDS = 10000u;
-static constexpr uint32_t NUM_WARMUP = 200u;
+static constexpr uint32_t NUM_ROUNDS = 100000u;
+static constexpr uint32_t NUM_WARMUP = 2000u;
 
 struct alignas(64) PingPongPad {
 	uint32_t ctr;
@@ -72,7 +72,7 @@ static double get_gpu_tick_ns(ze_device_handle_t ze_dev) {
  *
  * Memory ordering path:
  *   - Poll loads:  lsc_load.ugm.uc.uc
- *   - Writes:      lsc_atomic_store.ugm
+ *   - Writes:      lsc_store.ugm.uc.uc
  *   - Fences:      lsc_fence.ugm.invalidate / lsc_fence.ugm.evict
  */
 
@@ -100,8 +100,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 					uint32_t one = 1u;
 #ifdef __SYCL_DEVICE_ONLY__
 					__asm__ volatile (
-						"lsc_atomic_store.ugm (M1, 16)"
-						"  %%null:d32 flat[%0]:a64 %1 %%null\n"
+						"lsc_store.ugm.uc.uc (M1, 16)"
+						"  flat[%0]:a64 %1:d32\n"
 						: : "rw"(local_ready), "rw"(one)
 					);
 					__asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -128,8 +128,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 						uint32_t one = 1u;
 #ifdef __SYCL_DEVICE_ONLY__
 						__asm__ volatile (
-							"lsc_atomic_store.ugm (M1, 16)"
-							"  %%null:d32 flat[%0]:a64 %1 %%null\n"
+							"lsc_store.ugm.uc.uc (M1, 16)"
+							"  flat[%0]:a64 %1:d32\n"
 							: : "rw"(peer_start), "rw"(one)
 						);
 						__asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -167,8 +167,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 #endif
 #ifdef __SYCL_DEVICE_ONLY__
 						__asm__ volatile (
-							"lsc_atomic_store.ugm (M1, 16)"
-							"  %%null:d32 flat[%0]:a64 %1 %%null\n"
+							"lsc_store.ugm.uc.uc (M1, 16)"
+							"  flat[%0]:a64 %1:d32\n"
 							: : "rw"(peer_ctr), "rw"(req)
 						);
 						__asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -202,8 +202,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 #ifdef __SYCL_DEVICE_ONLY__
 						__asm__ volatile ("lsc_fence.ugm.invalidate.tile\n" : : :);
 						__asm__ volatile (
-							"lsc_atomic_store.ugm (M1, 16)"
-							"  %%null:d32 flat[%0]:a64 %1 %%null\n"
+							"lsc_store.ugm.uc.uc (M1, 16)"
+							"  flat[%0]:a64 %1:d32\n"
 							: : "rw"(peer_ctr), "rw"(rep)
 						);
 						__asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -218,8 +218,8 @@ static sycl::event submit_pingpong_kernel(sycl::queue &kq,
 					uint32_t done = is_initiator ? num_rounds : 1u;
 #ifdef __SYCL_DEVICE_ONLY__
 					__asm__ volatile (
-						"lsc_atomic_store.ugm (M1, 16)"
-						"  %%null:d32 flat[%0]:a64 %1 %%null\n"
+						"lsc_store.ugm.uc.uc (M1, 16)"
+						"  flat[%0]:a64 %1:d32\n"
 						: : "rw"(local_done), "rw"(done)
 					);
 					__asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -242,13 +242,13 @@ static double run_session(sycl::queue &q,
 						  int rank) {
 	q.memset(local, 0, sizeof(PingPongPad)).wait();
 
-	MPI_Barrier(MPI_COMM_WORLD);
-	auto evt = submit_pingpong_kernel(q, local, peer, rounds, is_initiator);
-
 	uint64_t host_ts_begin = 0;
 	uint64_t gpu_ts_begin = 0;
 	uint64_t host_ts_end = 0;
 	uint64_t gpu_ts_end = 0;
+
+	MPI_Barrier(MPI_COMM_WORLD);
+	auto evt = submit_pingpong_kernel(q, local, peer, rounds, is_initiator);
 
 	if (is_initiator) {
 		zeDeviceGetGlobalTimestamps(ze_dev, &host_ts_begin, &gpu_ts_begin);

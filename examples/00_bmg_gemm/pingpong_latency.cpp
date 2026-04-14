@@ -31,7 +31,7 @@
  *             SFENCE                            (flush write-combine buffer → device DRAM)
  *   2. GPU:   lsc_load.ugm.uc.uc  poll  device_buf.ctr  until == 2*r+1  (local DRAM poll)
  *             lsc_fence.ugm.invalidate.tile
- *             lsc_atomic_store.ugm  host_buf.ctr = 2*r+2  (even — GPU writes via PCIe)
+ *             lsc_store.ugm.uc.uc  host_buf.ctr = 2*r+2  (even — GPU writes via PCIe, posted)
  *             lsc_fence.ugm.evict.tile
  *   3. Host:  PAUSE-loop on host_buf.ctr until == 2*r+2
  *             LFENCE + RDTSCP → t_end
@@ -64,11 +64,12 @@
  *   via %0/%1 substitution.  The compiler allocates registers and broadcasts
  *   scalar addresses to SIMD16 automatically.
  * - All UGM (global/PCIe) LSC ops use (M1,16) — SIMD1 ops are silently dropped.
- * - lsc_atomic_store.ugm (not lsc_store.ugm.uc.uc) for GPU→host DRAM writes.
- * - %%null escapes to %null in the emitted vISA string.
+ * - lsc_store.ugm.uc.uc (M1,16) for GPU→host DRAM writes: posted write, GPU does
+ *   not wait for a PCIe completion TLP — lower GPU-side reply latency than atomic_store.
+ * - %%null is NOT needed for lsc_store (no result operand), unlike lsc_atomic_store.
  * - No sycl::atomic_ref or sycl::atomic_fence anywhere in the kernel — all
  *   system-scope operations go through typed asm UGM instructions directly.
- * - Priming store (lsc_atomic_store.ugm to host_buf.ctr=0 before the ready
+ * - Priming store (lsc_store.ugm.uc.uc to host_buf.ctr=0 before the ready
  *   signal) is required on BMG; without it the first reply is silently dropped.
  *
  * Build
@@ -397,15 +398,15 @@ static void submit_pingpong_kernel(sycl::queue &kq,
                 uint32_t *rp = &host_ptr->ready;
 
                 // PCIe-path priming: write 0 to host_ptr->ctr via the same
-                // lsc_atomic_store.ugm + evict-fence used by the main loop.
+                // lsc_store.ugm.uc.uc + evict-fence used by the main loop.
                 // This establishes the PCIe write path so subsequent asm UGM
                 // stores in the main loop are not silently dropped on BMG.
                 {
                     uint32_t zero = 0u;
 #ifdef __SYCL_DEVICE_ONLY__
                     __asm__ volatile (
-                        "lsc_atomic_store.ugm (M1, 16)"
-                        "  %%null:d32 flat[%0]:a64 %1 %%null\n"
+                        "lsc_store.ugm.uc.uc (M1, 16)"
+                        "  flat[%0]:a64 %1:d32\n"
                         : : "rw"(hp), "rw"(zero)
                     );
                     __asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -419,8 +420,8 @@ static void submit_pingpong_kernel(sycl::queue &kq,
                     uint32_t one = 1u;
 #ifdef __SYCL_DEVICE_ONLY__
                     __asm__ volatile (
-                        "lsc_atomic_store.ugm (M1, 16)"
-                        "  %%null:d32 flat[%0]:a64 %1 %%null\n"
+                        "lsc_store.ugm.uc.uc (M1, 16)"
+                        "  flat[%0]:a64 %1:d32\n"
                         : : "rw"(rp), "rw"(one)
                     );
                     __asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
@@ -449,8 +450,8 @@ static void submit_pingpong_kernel(sycl::queue &kq,
                 // Per-round structure:
                 //   1. C++ while loop: asm load polls dev_buf.ctr (device DRAM, local) until == exp
                 //   2. asm fence (invalidate) — ensure load ordering
-                //   3. asm atomic store     — write reply to host_buf.ctr via PCIe
-                //   4. asm fence (evict)    — push write out across PCIe to host DRAM
+                //   3. asm store (posted)     — write reply to host_buf.ctr via PCIe
+                //   4. asm fence (evict)      — push write out across PCIe to host DRAM
                 //
                 for (uint32_t r = 0; r < num_rounds; r++) {
                     const uint32_t exp = 2u * r + 1u;
@@ -471,8 +472,8 @@ static void submit_pingpong_kernel(sycl::queue &kq,
 #ifdef __SYCL_DEVICE_ONLY__
                     __asm__ volatile ("lsc_fence.ugm.invalidate.tile\n" : : :);
                     __asm__ volatile (
-                        "lsc_atomic_store.ugm (M1, 16)"
-                        "  %%null:d32 flat[%0]:a64 %1 %%null\n"
+                        "lsc_store.ugm.uc.uc (M1, 16)"
+                        "  flat[%0]:a64 %1:d32\n"
                         : : "rw"(hp), "rw"(rep)
                     );
                     __asm__ volatile ("lsc_fence.ugm.evict.tile\n" : : :);
