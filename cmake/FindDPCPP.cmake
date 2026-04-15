@@ -77,7 +77,7 @@ if (SYCL_INTEL_TARGET)
 
   foreach(TGT IN LISTS DPCPP_SYCL_TARGET_LIST)
     if(TGT STREQUAL "intel_gpu_bmg_g21" OR TGT STREQUAL "bmg")
-      list(APPEND SYCL_DEVICES "bmg_g21")
+      list(APPEND SYCL_DEVICES "bmg-g21")
     elseif(TGT STREQUAL "intel_gpu_pvc" OR TGT STREQUAL "pvc")
       list(APPEND SYCL_DEVICES "pvc")
     endif()
@@ -87,7 +87,7 @@ if (SYCL_INTEL_TARGET)
 
   string(JOIN "," SYCL_DEVICES_STR ${SYCL_DEVICES})
 
-  list(APPEND DPCPP_LINK_ONLY_FLAGS "-fsycl-targets=spir64")
+  list(APPEND DPCPP_LINK_ONLY_FLAGS "-fsycl-targets=spir64_gen")
   list(APPEND DPCPP_LINK_ONLY_FLAGS "-Xs;-device ${SYCL_DEVICES_STR}")
 
   list(APPEND DPCPP_LINK_ONLY_FLAGS "-Xspirv-translator")

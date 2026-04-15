@@ -546,6 +546,130 @@ void allreduce_device(
   out[vec_idx] = sum.template as<sycl::vec<int64_t, NUM_PER_TH>>();
 }
 
+inline void allreduce_store_release_u32(uint32_t* addr, uint32_t val) {
+  *addr = val;
+  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+}
+
+inline uint32_t allreduce_load_acquire_u32(uint32_t* addr) {
+  sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+  return *addr;
+}
+
+inline bool one_shot_wait_value(
+    uint32_t* addr,
+    uint32_t expected,
+    int* error_flag,
+    uint32_t max_spins) {
+  uint32_t spins = 0;
+  while (allreduce_load_acquire_u32(addr) != expected) {
+    if (spins++ >= max_spins) {
+      if (error_flag) {
+        *error_flag = 1;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+inline void one_shot_signal_sync(
+    sycl::nd_item<1> item,
+    uint32_t** signal_pads,
+    int rank,
+    int world_size,
+    int* error_flag,
+    uint32_t max_spins,
+  uint32_t signal_token) {
+  int lid = static_cast<int>(item.get_local_id(0));
+  int lsize = static_cast<int>(item.get_local_range(0));
+  for (int peer = lid; peer < world_size; peer += lsize) {
+    if (peer != rank) {
+      uint32_t* put_addr = signal_pads[peer] + rank; // tell others I'm ready
+      uint32_t* wait_addr = signal_pads[rank] + peer; // check if peers to let me know they are ready
+      allreduce_store_release_u32(put_addr, signal_token);
+      // Wait until peer publishes to my slot
+      if (!one_shot_wait_value(wait_addr, signal_token, error_flag, max_spins)) {
+        break;
+      }
+    }
+  }
+  sycl::group_barrier(item.get_group());
+}
+
+template <int NUM_PER_TH>
+void one_shot_allreduce_device(
+    sycl::nd_item<1> item,
+    void** ipc_data_ptrs,         // device-side slot pointers [world_size]
+    uint32_t** ipc_signal_ptrs,   // device-side signal pad pointers [world_size]
+    SyclBF16* local_slot_ptr,     // this rank's symmetric-memory slot
+    SyclBF16 const* local_input,  // local input to publish before reduce
+    SyclBF16* d_ptr,              // output buffer
+    int rank,
+    int world_size,
+    int64_t n_elems,
+    int* error_flag,
+    uint32_t signal_token,
+    uint32_t max_spins = 100000000u) {
+
+  constexpr int BF16_PER_I64 = 4;
+  constexpr int BF16_VEC_SIZE = NUM_PER_TH * BF16_PER_I64;
+  static_assert(BF16_VEC_SIZE <= 16, "NUM_PER_TH * 4 must be <= 16 for sycl::vec");
+
+  using VecI64 = sycl::vec<int64_t, NUM_PER_TH>;
+  using VecBF16 = sycl::vec<SyclBF16, BF16_VEC_SIZE>;
+
+  const int64_t i64_elems = n_elems / BF16_PER_I64;
+  const int64_t vec_elems = i64_elems / NUM_PER_TH;
+  const int64_t global_id = static_cast<int64_t>(item.get_global_linear_id());
+  const int64_t global_stride = static_cast<int64_t>(item.get_global_range(0));
+
+  auto const* in_vec = reinterpret_cast<VecI64 const*>(local_input);
+  auto* slot_vec = reinterpret_cast<VecI64*>(local_slot_ptr);
+
+  for (int64_t vec_idx = global_id; vec_idx < vec_elems; vec_idx += global_stride) {
+    slot_vec[vec_idx] = in_vec[vec_idx]; // copy from local input to local symm slot as vec<int64_t>
+  }
+
+  // tell other peers that local symm data is ready and you can do pull now.
+  one_shot_signal_sync(
+      item,
+      ipc_signal_ptrs,
+      rank,
+      world_size,
+      error_flag,
+      max_spins,
+      signal_token);
+  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+  if (error_flag && *error_flag) {
+    return;
+  }
+
+  // start to get data from peers and reduce
+  auto* out_vec = reinterpret_cast<VecI64*>(d_ptr);
+  for (int64_t vec_idx = global_id; vec_idx < vec_elems; vec_idx += global_stride) {
+    auto* buf0 = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[0]);
+    VecBF16 sum = buf0[vec_idx].template as<VecBF16>();
+
+    for (int r = 1; r < world_size; ++r) {
+      auto* buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[r]);
+      sum += buf[vec_idx].template as<VecBF16>();
+    }
+
+    out_vec[vec_idx] = sum.template as<VecI64>();
+  }
+
+  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+  one_shot_signal_sync(
+      item,
+      ipc_signal_ptrs,
+      rank,
+      world_size,
+      error_flag,
+      max_spins,
+      signal_token + 1);
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Kernel name tags
 /////////////////////////////////////////////////////////////////////////////////////////////////
