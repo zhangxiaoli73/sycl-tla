@@ -209,8 +209,9 @@ struct Runner {
 
     std::cout << "[rank " << rank << "] Starting one-shot allreduce benchmark for "
               << options.iterations << " iterations..." << std::endl;
+    
+              q_->memset(dev_error, 0, sizeof(int)).wait();
     auto t0 = std::chrono::high_resolution_clock::now();
-    q_->memset(dev_error, 0, sizeof(int)).wait();
     for (int iter = 0; iter < options.iterations; ++iter) {
       launch_one_shot_allreduce<NUM_PER_TH>(
           dev_slot_ptrs,

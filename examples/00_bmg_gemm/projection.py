@@ -143,7 +143,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     data_type_size = parse_data_type_size(args.dtype)
-
+    
+    time_allgather = proj_allgather(args.m * args.n * data_type_size, args.tp)
+    print(f"Projected allgather time for {args.m}x{args.n} matrix with {args.tp} TP: {time_allgather * 1000:.3f} ms")
+    
     print(f"Input: M={args.m}, N={args.n}, K={args.k}, dtype={args.dtype}, tp={args.tp}, pattern={args.pattern}")
 
     if args.pattern in ["allgather_gemm", "both"]:

@@ -209,7 +209,7 @@ void gemm_device(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Fused GEMM + Push: GEMM WG computes its tile, then pushes to all peers
+// Fused GEMM + Allreduce (pull-only): GEMM WG computes tile and signals completion
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <class ATensor, class BTensor, class CTensor, class TiledMMA>
@@ -307,42 +307,7 @@ void gemm_and_push(
   // ---- Write to local data_slots[my_rank] via copy_c ----
   copy(copy_c, tCrC, tCgC);
 
-  // ---- Push to remote peers (push mode) or just signal (pull mode) ----
-  int tile_m = int(get<0>(wg_tile));
-  int tile_n = int(get<1>(wg_tile));
-  int64_t tile_offset = static_cast<int64_t>(wg_m) * tile_m * params.N
-                       + static_cast<int64_t>(wg_n) * tile_n;
-  int64_t slot_offset = static_cast<int64_t>(params.my_rank) * params.M * params.N;
-  int wg_size = int(item.get_local_range(0));
-
-  if (params.use_push_mode) {
-    // Push: copy tile data to every remote peer's data_slots[my_rank]
-    // Copy path assumes M/N are 256-aligned in launcher checks.
-
-    for (int peer = 0; peer < params.world_size; ++peer) {
-      if (peer == params.my_rank) continue;
-      SyclBF16* remote_slot = params.remote_data_slots_dev[peer] + slot_offset;
-      SyclBF16* local_slot = params.local_data_slots + slot_offset;
-      // Fast vectorized copy in row-major order (32B = 16 bf16 per transaction).
-      constexpr int NUM_PER_TH = 4;
-      constexpr int BF16_PER_VEC = NUM_PER_TH * 4;
-      using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
-
-      int vec_cols = tile_n / BF16_PER_VEC;
-      int vec_stride_n = params.N / BF16_PER_VEC;
-      int64_t tile_vec_offset = tile_offset / BF16_PER_VEC;
-      LoadVec* remote_vec = reinterpret_cast<LoadVec*>(remote_slot);
-      LoadVec* local_vec = reinterpret_cast<LoadVec*>(local_slot);
-
-      for (int row = 0; row < tile_m; ++row) {
-        int64_t row_vec_base = tile_vec_offset + static_cast<int64_t>(row) * vec_stride_n;
-        for (int vc = local_id; vc < vec_cols; vc += wg_size) {
-          int64_t vec_off = row_vec_base + vc;
-          remote_vec[vec_off] = local_vec[vec_off];
-        }
-      }
-    }
-  }
+  // Pull-only path: no remote push writes from GEMM workgroups.
 
   // Memory fence before setting flags
   sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
@@ -351,23 +316,17 @@ void gemm_and_push(
   if (local_id == 0) {
     int flag_idx = params.my_rank * params.num_m_tiles * params.num_n_tiles
                  + wg_m * params.num_n_tiles + wg_n;
-    if (params.use_push_mode) {
-      // Push mode: set flag on every peer's flag buffer
-      for (int peer = 0; peer < params.world_size; ++peer) {
-        params.remote_flags_dev[peer][flag_idx] = params.signal_token;
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-      }
-    } else {
-      // Pull mode: set flag on local flag buffer only
-      params.local_flags[flag_idx] = params.signal_token;
-      sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-    }
+    // Pull mode: set flag on local flag buffer only
+    params.local_flags[flag_idx] = params.signal_token;
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
   }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Reducer WG: polls flags, reduces data_slots, writes to D
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline uint32_t allreduce_load_acquire_u32(uint32_t* addr);
 
 inline void reducer_work(
     sycl::nd_item<2> item,
@@ -384,6 +343,9 @@ inline void reducer_work(
   using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
   using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
 
+  auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
+  int64_t rank_slot_vec_stride = (static_cast<int64_t>(params.M) * params.N) / BF16_PER_VEC;
+
   int tile_m_size = 256;
   int tile_n_size = 256;
 
@@ -397,18 +359,12 @@ inline void reducer_work(
       for (int src = 0; src < params.world_size; ++src) {
         int flag_idx = src * params.num_m_tiles * params.num_n_tiles
                      + tile_m * params.num_n_tiles + tile_n;
-        uint32_t* flag_ptr;
-        if (params.use_push_mode) {
-          // Push mode: flags are on local buffer (peers wrote here)
-          flag_ptr = &params.local_flags[flag_idx];
-        } else {
-          // Pull mode: flags are on remote buffer (read from peer)
-          flag_ptr = &params.remote_flags_dev[src][flag_idx];
-        }
-        auto flag_val = *flag_ptr;
+        // Pull mode: flags are on remote buffer (read from peer)
+        uint32_t* flag_ptr = &params.remote_flags_dev[src][flag_idx];
+        auto flag_val = allreduce_load_acquire_u32(flag_ptr);
         while (flag_val != params.signal_token) {
           // spin-wait
-          flag_val = *flag_ptr;
+          flag_val = allreduce_load_acquire_u32(flag_ptr);
         }
       }
     }
@@ -423,37 +379,23 @@ inline void reducer_work(
       int64_t bf16_idx = vi * BF16_PER_VEC;
       int row = static_cast<int>(bf16_idx / tile_n_size);
       int col = static_cast<int>(bf16_idx % tile_n_size);
-      int64_t global_offset = (static_cast<int64_t>(tile_m) * tile_m_size + row)
-                              * params.N
-                              + static_cast<int64_t>(tile_n) * tile_n_size + col;
+      int64_t global_offset = (static_cast<int64_t>(tile_m) * tile_m_size + row) * params.N
+                            + static_cast<int64_t>(tile_n) * tile_n_size + col;
+      int64_t global_vec_offset = global_offset / BF16_PER_VEC;
 
       // Load from rank 0's slot
-      int64_t slot0_offset = 0 * static_cast<int64_t>(params.M) * params.N + global_offset;
-      SyclBF16* slot0_ptr;
-      if (params.use_push_mode) {
-        slot0_ptr = params.local_data_slots;
-      } else {
-        slot0_ptr = params.remote_data_slots_dev[0];
-      }
-      LoadVec raw0 = reinterpret_cast<LoadVec*>(slot0_ptr + slot0_offset)[0];
-      BF16Vec sum = raw0.template as<BF16Vec>();
+      auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[0]);
+      BF16Vec sum = buf0[global_vec_offset].template as<BF16Vec>();
 
       // Accumulate from remaining ranks
       for (int src = 1; src < params.world_size; ++src) {
-        int64_t slot_offset = static_cast<int64_t>(src) * params.M * params.N + global_offset;
-        SyclBF16* slot_ptr;
-        if (params.use_push_mode) {
-          slot_ptr = params.local_data_slots;
-        } else {
-          slot_ptr = params.remote_data_slots_dev[src];
-        }
-        LoadVec raw = reinterpret_cast<LoadVec*>(slot_ptr + slot_offset)[0];
-        sum += raw.template as<BF16Vec>();
+        auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
+        int64_t slot_vec_offset = static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset;
+        sum += buf[slot_vec_offset].template as<BF16Vec>();
       }
 
       // Store reduced result to D
-      reinterpret_cast<LoadVec*>(params.D + global_offset)[0] =
-          sum.template as<LoadVec>();
+      out_vec[global_vec_offset] = sum.template as<LoadVec>();
     }
 
     sycl::group_barrier(item.get_group());
@@ -480,6 +422,8 @@ void gemm_allreduce_device(
     int n,
     int num_n_tiles) {
 
+  (void)use_push_mode;
+
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
   int reducer_id = int(item.get_group(1)) * num_n_tiles + int(item.get_group(0));
 
@@ -503,7 +447,8 @@ void gemm_allreduce_device(
   params.remote_flags_dev = reinterpret_cast<uint32_t**>(ipc_signal_ptrs);
   params.D = reinterpret_cast<SyclBF16*>(D.data().get());
   params.ldd = stride<0>(D);
-  params.use_push_mode = use_push_mode;
+  // Keep pull-only behavior in gemm_allreduce_device path.
+  params.use_push_mode = false;
   params.signal_token = signal_token;
 
   gemm_and_push(A, B, C, mma, alpha, params);
