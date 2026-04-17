@@ -26,8 +26,6 @@ struct Options {
   int n = 4096;
   int iterations = 20;
   int verify = 1;
-  int wg_size = 0;      // 0 = auto
-  int max_blocks = 0;   // 0 = auto
 
   void parse(int argc, char** argv) {
     std::vector<char const*> cargs(argc);
@@ -45,8 +43,6 @@ struct Options {
     cmd.get_cmd_line_argument("n", n, 4096);
     cmd.get_cmd_line_argument("iterations", iterations, 20);
     cmd.get_cmd_line_argument("verify", verify, 1);
-    cmd.get_cmd_line_argument("wg_size", wg_size, 0);
-    cmd.get_cmd_line_argument("max_blocks", max_blocks, 0);
   }
 
   std::ostream& print_usage(std::ostream& out) const {
@@ -54,12 +50,11 @@ struct Options {
         << "  --m=<int>            rows (default 8192)\\n"
         << "  --n=<int>            cols (default 4096)\\n"
         << "  --iterations=<int>   benchmark iterations (default 20)\\n"
-        << "  --verify=<int>       0/1 verify output (default 1)\\n"
-        << "  --wg_size=<int>      work-group size, 0=auto (default 0)\\n"
-        << "  --max_blocks=<int>   launch blocks cap, 0=auto (default 0)\\n\\n"
+        << "  --verify=<int>       0/1 verify output (default 1)\\n\\n"
         << "Constraints:\\n"
-        << "  - This one-shot path is vector-only. m * n must be divisible by alignment/sizeof(bf16).\\n"
-        << "    With current build-time alignment=32 bytes, m * n must be divisible by 16.\\n\\n";
+        << "  - This one-shot path is vector-only. m * n must be divisible by NUM_PER_TH * 4\\n"
+        << "    bf16 elements. With the current build-time setting NUM_PER_TH=4, m * n must be\\n"
+        << "    divisible by 16.\\n\\n";
     return out;
   }
 };
@@ -82,36 +77,26 @@ struct Runner {
       int rank,
       int world_size,
       int64_t n_elems,
-      uint32_t signal_token,
-      int cfg_wg_size,
-      int cfg_max_blocks) {
+      uint32_t signal_token) {
 
     constexpr int BF16_PER_I64 = 4;
-    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;  // bf16 elements per thread vector op
+    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
 
     if ((n_elems % BF16_VEC) != 0) {
       throw std::runtime_error(
         "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
     }
 
-    // Thread sizing (inspired by CUDA one-shot: target ~512 threads to limit register pressure)
     int dev_max_wg = static_cast<int>(
         q_->get_device().get_info<sycl::info::device::max_work_group_size>());
-    int auto_wg_size = std::min(dev_max_wg, 256);
-    int wg_size = (cfg_wg_size > 0) ? std::min(dev_max_wg, cfg_wg_size) : auto_wg_size;
-    if (wg_size <= 0) {
-      throw std::runtime_error("Invalid wg_size after device clamp.");
-    }
+    // int wg_size = std::max(64, std::min(dev_max_wg, 256));
+    const int wg_size = static_cast<int>(q_->get_device().get_info<sycl::info::device::max_work_group_size>()) / BF16_VEC;
 
     int64_t vec_elems = n_elems / BF16_VEC;
     int64_t blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    int auto_max_blocks = std::max(1, static_cast<int>(
-      q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
-    int max_blocks = (cfg_max_blocks > 0) ? cfg_max_blocks : auto_max_blocks;
-    blocks = std::min<int64_t>(blocks, max_blocks);
+    blocks = std::min<int64_t>(blocks, 32);
     int64_t global_size = blocks * wg_size;
 
-    // Submit kernel with explicit workgroup size for better occupancy
     q_->submit([&](sycl::handler& h) {
       h.parallel_for<StandaloneOneShotAllreduceKernelName<NUM_PER_TH>>(
           sycl::nd_range<1>(
@@ -197,23 +182,7 @@ struct Runner {
     q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
                static_cast<size_t>(world_size) * sizeof(void*)).wait();
 
-    constexpr int ALIGNMENT_BYTES = 32;
-    static_assert(ALIGNMENT_BYTES % sizeof(Element) == 0,
-                  "ALIGNMENT_BYTES must be divisible by element size");
-    constexpr int ELEM_PER_THREAD = ALIGNMENT_BYTES / sizeof(Element);
-    static_assert((ELEM_PER_THREAD % 4) == 0,
-                  "ELEM_PER_THREAD must be divisible by 4 for VecI64 packing");
-    constexpr int NUM_PER_TH = ELEM_PER_THREAD / 4;
-
-    if (rank == 0) {
-      std::cout << "[one-shot] alignment=" << ALIGNMENT_BYTES
-                << "B, elements-per-thread=" << ELEM_PER_THREAD
-                << ", NUM_PER_TH=" << NUM_PER_TH
-                << ", wg_size=" << (options.wg_size > 0 ? options.wg_size : std::min(static_cast<int>(q_->get_device().get_info<sycl::info::device::max_work_group_size>()), 256))
-                << ", max_blocks=" << (options.max_blocks > 0 ? options.max_blocks : std::max(1, static_cast<int>(q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8))
-                << std::endl;
-    }
-
+    constexpr int NUM_PER_TH = 4;
     uint32_t signal_token = 1;
     std::cout << "[rank " << rank << "] Starting one-shot allreduce warmup..." << std::endl;
     for (int i = 0; i < 5; ++i) {
@@ -228,9 +197,7 @@ struct Runner {
           rank,
           world_size,
           n_elems,
-          signal_token,
-          options.wg_size,
-          options.max_blocks);
+          signal_token);
       signal_token += 2;
       q_->wait();
       int host_error = 0;
@@ -242,8 +209,8 @@ struct Runner {
 
     std::cout << "[rank " << rank << "] Starting one-shot allreduce benchmark for "
               << options.iterations << " iterations..." << std::endl;
-    q_->memset(dev_error, 0, sizeof(int)).wait();
-     MPI_Barrier(MPI_COMM_WORLD);
+    
+              q_->memset(dev_error, 0, sizeof(int)).wait();
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int iter = 0; iter < options.iterations; ++iter) {
       launch_one_shot_allreduce<NUM_PER_TH>(
@@ -256,11 +223,8 @@ struct Runner {
           rank,
           world_size,
           n_elems,
-          signal_token,
-          options.wg_size,
-          options.max_blocks);
+          signal_token);
       signal_token += 2;
-      MPI_Barrier(MPI_COMM_WORLD);
     }
     q_->wait();
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -276,10 +240,13 @@ struct Runner {
     double avg_ms = total_ms / std::max(1, options.iterations);
 
     if (true) {
+      double gb = static_cast<double>(n_elems * sizeof(Element) * (world_size + 1)) / 1e9;
+      double gbps = gb / (avg_ms / 1000.0);
       std::cout << "Allreduce one-shot standalone: m=" << m
                 << " n=" << n
                 << " world_size=" << world_size
-                << " avg_ms=" << avg_ms << std::endl;
+                << " avg_ms=" << avg_ms
+                << " BW=" << gbps << " GB/s" << std::endl;
     }
 
     bool passed = true;

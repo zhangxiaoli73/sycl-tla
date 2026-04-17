@@ -388,6 +388,7 @@ inline void reducer_work(
       BF16Vec sum = buf0[global_vec_offset].template as<BF16Vec>();
 
       // Accumulate from remaining ranks
+      #pragma unroll 8
       for (int src = 1; src < params.world_size; ++src) {
         auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
         int64_t slot_vec_offset = static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset;
@@ -482,6 +483,7 @@ void allreduce_device(
   auto sum = buf0[vec_idx].template as<sycl::vec<SyclBF16, BF16_VEC_SIZE>>();
 
   // Accumulate remaining peers
+  #pragma unroll
   for (int r = 1; r < world_size; ++r) {
     auto* buf = reinterpret_cast<const sycl::vec<int64_t, NUM_PER_TH>*>(ipc_data_ptrs[r]);
     sum += buf[vec_idx].template as<sycl::vec<SyclBF16, BF16_VEC_SIZE>>();
@@ -528,6 +530,7 @@ inline void one_shot_signal_sync(
   uint32_t signal_token) {
   int lid = static_cast<int>(item.get_local_id(0));
   int lsize = static_cast<int>(item.get_local_range(0));
+  #pragma unroll
   for (int peer = lid; peer < world_size; peer += lsize) {
     if (peer != rank) {
       uint32_t* put_addr = signal_pads[peer] + rank; // tell others I'm ready
@@ -577,42 +580,45 @@ void one_shot_allreduce_device(
   }
 
   // tell other peers that local symm data is ready and you can do pull now.
-  one_shot_signal_sync(
-      item,
-      ipc_signal_ptrs,
-      rank,
-      world_size,
-      error_flag,
-      max_spins,
-      signal_token);
-  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-  if (error_flag && *error_flag) {
-    return;
-  }
+  // one_shot_signal_sync(
+  //     item,
+  //     ipc_signal_ptrs,
+  //     rank,
+  //     world_size,
+  //     error_flag,
+  //     max_spins,
+  //     signal_token);
+  // sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+  // if (error_flag && *error_flag) {
+  //   return;
+  // }
 
-  // start to get data from peers and reduce
+  // Reduction phase: load-and-reduce (inspired by CUDA load_and_reduce algorithm)
+  // Use rank-rotated load order to avoid all ranks reading peer 0 first.
   auto* out_vec = reinterpret_cast<VecI64*>(d_ptr);
   for (int64_t vec_idx = global_id; vec_idx < vec_elems; vec_idx += global_stride) {
-    auto* buf0 = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[0]);
-    VecBF16 sum = buf0[vec_idx].template as<VecBF16>();
+    auto* first_buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[rank]);
+    VecBF16 sum = first_buf[vec_idx].template as<VecBF16>();
 
-    for (int r = 1; r < world_size; ++r) {
-      auto* buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[r]);
+    #pragma unroll
+    for (int step = 1; step < world_size; ++step) {
+      int remote_rank = (rank + step) % world_size;
+      auto* buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[remote_rank]);
       sum += buf[vec_idx].template as<VecBF16>();
     }
 
     out_vec[vec_idx] = sum.template as<VecI64>();
   }
 
-  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-  one_shot_signal_sync(
-      item,
-      ipc_signal_ptrs,
-      rank,
-      world_size,
-      error_flag,
-      max_spins,
-      signal_token + 1);
+  // sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+  // one_shot_signal_sync(
+  //     item,
+  //     ipc_signal_ptrs,
+  //     rank,
+  //     world_size,
+  //     error_flag,
+  //     max_spins,
+  //     signal_token + 1);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
