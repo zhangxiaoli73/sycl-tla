@@ -150,15 +150,46 @@ struct Runner {
     size_t per_rank_elems = static_cast<size_t>(m) * n;
     size_t total_data_elems = per_rank_elems * world_size;
 
+    // one_shot_signal_sync indexes signal pad as [block_id * world_size + rank],
+    // so signal pad storage must cover all launched blocks.
+    constexpr int ALIGNMENT_BYTES = 32;
+    constexpr int BF16_PER_I64 = 4;
+    constexpr int ELEM_PER_THREAD = ALIGNMENT_BYTES / sizeof(Element);
+    static_assert((ELEM_PER_THREAD % 4) == 0,
+                  "ELEM_PER_THREAD must be divisible by 4 for VecI64 packing");
+    constexpr int NUM_PER_TH = ELEM_PER_THREAD / 4;
+    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
+
+    if ((n_elems % BF16_VEC) != 0) {
+      throw std::runtime_error(
+          "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
+    }
+
+    int dev_max_wg = static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_work_group_size>());
+    int auto_wg_size = std::min(dev_max_wg, 256);
+    int wg_size = (options.wg_size > 0) ? std::min(dev_max_wg, options.wg_size) : auto_wg_size;
+    if (wg_size <= 0) {
+      throw std::runtime_error("Invalid wg_size after device clamp.");
+    }
+    int auto_max_blocks = std::max(1, static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
+    int max_blocks = (options.max_blocks > 0) ? options.max_blocks : auto_max_blocks;
+    int64_t vec_elems = n_elems / BF16_VEC;
+    int64_t required_blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
+    int64_t launch_blocks = std::min<int64_t>(required_blocks, max_blocks);
+    size_t signal_pad_elems = static_cast<size_t>(launch_blocks) * static_cast<size_t>(world_size);
+    std::cout << "Symm data elements: " << total_data_elems << ", signal pad elemements: " << signal_pad_elems << std::endl;
+
     if (!symm_) {
       symm_ = std::make_unique<SymmMemory>(
           m, n, 1, rank, world_size, *q_, 8,
-          total_data_elems, static_cast<size_t>(world_size));
+          total_data_elems, signal_pad_elems);
     }
 
     // one-shot handshake protocol assumes signal pads start from 0 on first launch.
     // Re-initialize local signal pad for this run.
-    q_->memset(symm_->local_signal_ptr_, 0, static_cast<size_t>(world_size) * sizeof(uint32_t)).wait();
+    q_->memset(symm_->local_signal_ptr_, 0, signal_pad_elems * sizeof(uint32_t)).wait();
     MPI_Barrier(MPI_COMM_WORLD);
 
     Element* local_data = reinterpret_cast<Element*>(symm_->local_data_ptr_);
@@ -197,13 +228,8 @@ struct Runner {
     q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
                static_cast<size_t>(world_size) * sizeof(void*)).wait();
 
-    constexpr int ALIGNMENT_BYTES = 32;
     static_assert(ALIGNMENT_BYTES % sizeof(Element) == 0,
-                  "ALIGNMENT_BYTES must be divisible by element size");
-    constexpr int ELEM_PER_THREAD = ALIGNMENT_BYTES / sizeof(Element);
-    static_assert((ELEM_PER_THREAD % 4) == 0,
-                  "ELEM_PER_THREAD must be divisible by 4 for VecI64 packing");
-    constexpr int NUM_PER_TH = ELEM_PER_THREAD / 4;
+            "ALIGNMENT_BYTES must be divisible by element size");
 
     if (rank == 0) {
       std::cout << "[one-shot] alignment=" << ALIGNMENT_BYTES

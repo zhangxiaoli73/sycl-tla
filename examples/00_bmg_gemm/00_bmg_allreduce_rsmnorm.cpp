@@ -135,15 +135,34 @@ struct Runner {
     size_t per_rank_elems = static_cast<size_t>(m) * n;
     size_t total_data_elems = per_rank_elems * world_size;
 
+    // one_shot_signal_sync indexes signal pad as [block_id * world_size + rank],
+    // so signal pad storage must cover all launched blocks.
+    constexpr int NUM_PER_TH = 4;
+    constexpr int BF16_PER_I64 = 4;
+    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
+    if ((n_elems % BF16_VEC) != 0) {
+      throw std::runtime_error(
+          "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
+    }
+    int wg_size = static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_work_group_size>()) / BF16_VEC;
+    if (wg_size <= 0) {
+      throw std::runtime_error("Invalid wg_size for one-shot allreduce.");
+    }
+    int64_t vec_elems = n_elems / BF16_VEC;
+    int64_t blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
+    blocks = std::min<int64_t>(blocks, 32);
+    size_t signal_pad_elems = static_cast<size_t>(blocks) * static_cast<size_t>(world_size);
+
     if (!symm_) {
       symm_ = std::make_unique<SymmMemory>(
           m, n, 1, rank, world_size, *q_, 8,
-          total_data_elems, static_cast<size_t>(world_size));
+          total_data_elems, signal_pad_elems);
     }
 
     // one-shot handshake protocol assumes signal pads start from 0 on first launch.
     // Re-initialize local signal pad for this run.
-    q_->memset(symm_->local_signal_ptr_, 0, static_cast<size_t>(world_size) * sizeof(uint32_t)).wait();
+    q_->memset(symm_->local_signal_ptr_, 0, signal_pad_elems * sizeof(uint32_t)).wait();
     MPI_Barrier(MPI_COMM_WORLD);
 
     Element* local_data = reinterpret_cast<Element*>(symm_->local_data_ptr_);
@@ -182,7 +201,6 @@ struct Runner {
     q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
                static_cast<size_t>(world_size) * sizeof(void*)).wait();
 
-    constexpr int NUM_PER_TH = 4;
     uint32_t signal_token = 1;
     std::cout << "[rank " << rank << "] Starting one-shot allreduce warmup..." << std::endl;
     for (int i = 0; i < 5; ++i) {
