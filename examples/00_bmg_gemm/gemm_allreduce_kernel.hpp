@@ -511,11 +511,10 @@ inline bool one_shot_wait_value(
   uint32_t spins = 0;
   while (allreduce_load_acquire_u32(addr) != expected) {
     if (spins++ >= max_spins) {
-      printf("Get local as %d, but expected is %d \n", *addr, expected);
-      // if (error_flag) {
-      //   *error_flag = 1;
-      // }
-      // return false;
+      if (error_flag) {
+        *error_flag = 1;
+      }
+      return false;
     }
   }
   return true;
@@ -529,18 +528,45 @@ inline void one_shot_signal_sync(
     int* error_flag,
     uint32_t max_spins,
   uint32_t signal_token) {
-  int lid = static_cast<int>(item.get_local_id(0));
   int64_t block_id = static_cast<int64_t>(item.get_group_linear_id());
-  int64_t block_base = block_id * static_cast<int64_t>(world_size);
-  if (lid < world_size && lid != rank) {
-    int target_rank = lid;
-    uint32_t* put_addr = signal_pads[target_rank] + block_base + rank;
-    uint32_t* wait_addr = signal_pads[rank] + block_base + target_rank;
-    allreduce_store_release_u32(put_addr, signal_token);
-    printf("write to remote rank = %d, put data = %d , local flag data = %d with base block = %ld \n", target_rank, *put_addr, *wait_addr, block_base);
-    (void)one_shot_wait_value(wait_addr, signal_token, error_flag, max_spins);
+  int64_t num_blocks = static_cast<int64_t>(item.get_group_range(0));
+  int lid = static_cast<int>(item.get_local_id(0));
+
+  // Stage A: each block leader marks local completion in its own slot.
+  if (lid == 0) {
+    uint32_t* local_done = signal_pads[rank] + block_id * static_cast<int64_t>(world_size) + rank;
+    allreduce_store_release_u32(local_done, signal_token);
   }
   sycl::group_barrier(item.get_group());
+
+  // Stage B: only block 0 performs one cross-rank handshake per launch.
+  if (block_id == 0) {
+    if (lid == 0) {
+      // Wait until all local blocks have marked completion.
+      for (int64_t b = 0; b < num_blocks; ++b) {
+        uint32_t* local_done = signal_pads[rank] + b * static_cast<int64_t>(world_size) + rank;
+        if (!one_shot_wait_value(local_done, signal_token, error_flag, max_spins)) {
+          break;
+        }
+      }
+
+      // Publish completion to peers and wait for their completion.
+      uint32_t peer_token = signal_token + 1;
+      for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) continue;
+        uint32_t* put_addr = signal_pads[peer] + rank;
+        allreduce_store_release_u32(put_addr, peer_token);
+      }
+      for (int peer = 0; peer < world_size; ++peer) {
+        if (peer == rank) continue;
+        uint32_t* wait_addr = signal_pads[rank] + peer;
+        if (!one_shot_wait_value(wait_addr, peer_token, error_flag, max_spins)) {
+          break;
+        }
+      }
+    }
+    sycl::group_barrier(item.get_group());
+  }
 }
 
 template <int NUM_PER_TH>
@@ -569,24 +595,27 @@ void one_shot_allreduce_device(
   const int64_t vec_elems = i64_elems / NUM_PER_TH;
   const int64_t global_id = static_cast<int64_t>(item.get_global_linear_id());
 
-  // Each work-item processes ONE vector element (no striding loop)
-  if (global_id >= vec_elems) return;
+  // Do not early-return before synchronization. Partial returns can deadlock
+  // at work-group barriers inside one_shot_signal_sync.
+  bool has_work = (global_id < vec_elems);
 
   auto const* in_vec = reinterpret_cast<VecI64 const*>(local_input);
   auto* out_vec = reinterpret_cast<VecI64*>(d_ptr);
 
-  // Load local rank's data directly from local_input
-  VecBF16 sum = in_vec[global_id].template as<VecBF16>();
+  if (has_work) {
+    // Load local rank's data directly from local_input.
+    VecBF16 sum = in_vec[global_id].template as<VecBF16>();
 
-  // Accumulate from remote ranks (rank-rotated to balance access)
-  #pragma unroll
-  for (int step = 1; step < world_size; ++step) {
-    int remote_rank = (rank + step) % world_size;
-    auto* buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[remote_rank]);
-    sum += buf[global_id].template as<VecBF16>();
+    // Accumulate from remote ranks (rank-rotated to balance access).
+    #pragma unroll
+    for (int step = 1; step < world_size; ++step) {
+      int remote_rank = (rank + step) % world_size;
+      auto* buf = reinterpret_cast<VecI64 const*>(ipc_data_ptrs[remote_rank]);
+      sum += buf[global_id].template as<VecBF16>();
+    }
+
+    out_vec[global_id] = sum.template as<VecI64>();
   }
-
-  out_vec[global_id] = sum.template as<VecI64>();
 
   sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
   one_shot_signal_sync(
@@ -596,7 +625,7 @@ void one_shot_allreduce_device(
       world_size,
       error_flag,
       max_spins,
-      signal_token + 1);
+      signal_token);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
