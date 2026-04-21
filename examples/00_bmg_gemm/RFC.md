@@ -1,4 +1,4 @@
-# RFC: Computation-Communication Overlap for Distributed GEMM Collectives
+# RFC: Computation-Communication Overlap for Distributed GEMM
 
 **Authors:**
 - @lzhang2
@@ -12,7 +12,7 @@ This RFC proposes a **native-layer** implementation for distributed GEMM collect
 - AllGather + GEMM
 - GEMM + ReduceScatter
 
-The current Python OP pattern is a strong proof of concept, but it has practical limitations for production use: relatively high host-side orchestration overhead, limited flexibility on platforms with asymmetric push/pull bandwidth, insufficient fallback guardrails when overlap is not beneficial, and limited access to advanced hardware paths (for example, Async DMA and copy-engine-aware scheduling).
+The current Python-side implementation is a strong proof of concept, but it has practical limitations for production use: limited flexibility on platforms with asymmetric read/write bandwidth, relatively high host-side launch overhead, insufficient fallback mechanism when overlap is not beneficial, and limited support for backend-specific implementation strategies.
 
 This proposal moves overlap-critical decision and execution paths into native APIs and keeps Python as a compatibility-preserving API/dispatch layer.
 
@@ -21,24 +21,23 @@ This proposal moves overlap-critical decision and execution paths into native AP
 
 This RFC focuses on design and interface choices for a native implementation path under the existing Python API surface.
 
-The implementation direction is driven by practical engineering constraints in the current Python path, especially around orchestration overhead, runtime policy control, and backend-specific capability usage.
+The implementation direction is driven by practical engineering constraints in the current Python path, especially around runtime read/write policy control, host-side launch overhead and backend-specific capability usage.
 
 ### Limitations of the current Python-side implementation
 
-The current Python OP pattern is a strong proof of concept, but it has practical limitations for production-grade overlap:
+The current Python-side implementation is a strong proof of concept, but it has practical limitations for production-grade overlap:
 
-- High host overhead from Python orchestration:
+- Limited flexibility across platforms with asymmetric communication bandwidth:
+	- Some platforms have different effective bandwidth for read (pull) vs write (push) modes.
+	- The current Python-side implementation does not select between read-mode and write-mode communication, which is not optimal on every platform.
+- High host overhead from Python-side launch and dispatch:
 	- Frequent launch and coordination steps increase host overhead.
 	- Python-side control flow and dispatch overhead can become non-trivial in latency-sensitive paths.
-- Limited flexibility across platforms with asymmetric communication characteristics:
-	- Some platforms have different effective bandwidth for pull vs push modes.
-	- Current Python implementation is primarily optimized around pull-style behavior, which is not optimal on every platform.
-- Insufficient fallback/guardrail mechanism at runtime:
+- Insufficient fallback mechanism at runtime:
 	- Without robust policy fallback, overlap can regress performance on some shapes.
 	- In unfavorable cases, overlap may be slower than non-overlap.
-- Fixed implementation shape limits use of advanced hardware capabilities:
-	- Harder to exploit backend-specific features such as Async DMA.
-	- This can also prevent freeing copy engines for other concurrent tasks, reducing overall system efficiency.
+- The Python-side implementation limits implementation flexibility and does not extend naturally to scale-out scenarios:
+	- In particular, it makes it difficult to adopt backend-specific implementations such as asynchronous GEMM pipelines built with CUTLASS, which can perform better on some shapes, especially small-M cases. It also does not naturally support computation-communication overlap in scale-out deployments where collectives span multiple nodes.
 
 These limitations motivate moving overlap-critical execution into native backend code while keeping Python-level APIs stable.
 
@@ -77,7 +76,7 @@ This RFC follows a layered model:
 - Native layer:
 	- owns overlap-critical execution and runtime policy
 	- exposes backend ops used by Python dispatcher
-	- enables platform-specific push/pull policy selection and advanced hardware paths (for example Async DMA where available)
+	- enables platform-specific read/write communication policy selection and backend-specific implementation strategies
 	- owns fallback policy logic and exports per-op gate APIs
 
 Interface exposure decision:

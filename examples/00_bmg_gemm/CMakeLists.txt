@@ -188,6 +188,11 @@ cutlass_example_add_executable(
 )
 
 cutlass_example_add_executable(
+  sycl_two_stream_test
+  sycl_two_stream_test.cpp
+)
+
+cutlass_example_add_executable(
   test_local_reduction
   test_local_reduction.cpp
 )
