@@ -2,7 +2,7 @@
 
 ## Allgather + GEMM
 
-| M    | N     | K    | cfg | Device TFlop/s | overlap+DLE25.2 Time (ms) | Host TFlop/s | Host Time (ms) | native+pytorch2.9+DLE25.2+oneCCL21.15(ms) | native+pytorch2.12+DLE25.3+oneCCL21.19(ms) | ratio   | projection(overlap) |
+| M    | N     | K    | cfg | Device TFlop/s | Overlap DLE25.2 Time (ms) | Host TFlop/s | Host Time (ms) | Native pytorch2.9 + DLE25.2 + oneCCL21.15 (ms) | Native pytorch2.12 + DLE25.3 + oneCCL21.19 (ms) | ratio   | projection (overlap) |
 |------|-------|------|-----|----------------|------------------|--------------|-----------------|-------------|--------------------------------|---------|---------------------|
 | 1024 | 1536  | 4096 | 5   | 34.313         | 0.3755           | 238.980      | 0.0539          | 0.698488    | 0.603915                       | 185.93% | 0.265370            |
 | 2048 | 1536  | 4096 | 12  | 37.217         | 0.6924           | 276.169      | 0.0933          | 1.091376    | 1.104285                       | 157.61% | 0.521740            |
@@ -23,7 +23,7 @@
 
 ## GEMM + Reduce-Scatter
 
-| M    | N    | K    | cfg | Device TFlop/s | overlap+DLE25.2 Time (ms) | Host TFlop/s | Host Time (ms) | native+pytorch2.9+DLE25.2+oneCCL21.15(ms) | native+pytorch2.12+DLE25.3+oneCCL21.19(ms) | ratio   | projection |
+| M    | N    | K    | cfg | Device TFlop/s | Overlap DLE25.2 Time (ms) | Host TFlop/s | Host Time (ms) | Native pytorch2.9 + DLE25.2 + oneCCL21.15 (ms) | Native pytorch2.12 + DLE25.3 + oneCCL21.19 (ms) | ratio   | projection (overlap) |
 |------|------|------|-----|----------------|------------------|--------------|-----------------|-------------|--------------------------------|---------|------------|
 | 1024 | 4096 | 1024 | 11  | 26.596         | 0.3230           | 85.704       | 0.1002          | 0.592800    | 0.794612                       | 183.40% | 0.273050   |
 | 2048 | 4096 | 1024 | 8   | 26.416         | 0.6504           | 137.133      | 0.1253          | 1.047192    | 0.926179                       | 160.92% | 0.537100   |
