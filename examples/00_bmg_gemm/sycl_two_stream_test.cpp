@@ -96,12 +96,7 @@ int main() {
         });
       });
 
-      stream1.submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(kChunkElements), [=](sycl::id<1> idx) {
-          std::size_t offset = begin + idx[0];
-          output[offset] = staging[offset];
-        });
-      });
+      stream1.memcpy(output + begin, staging + begin, kChunkElements * sizeof(float));
 
       if ((chunk + 1) % 2 == 0) {
         stream0.wait();
