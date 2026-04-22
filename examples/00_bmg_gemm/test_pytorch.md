@@ -1,4 +1,4 @@
-## 每个 run 的 fallback / symm ops 时间统计（单位: ms）- DLE 25.3
+## 每个 run 的 fallback / symm ops 时间统计（单位: ms）- DLE 25.3.2
 
 | run_idx | op | M | N | K | fallback_mean | fallback_median | symm_mean | symm_median |
 |---:|---|---:|---:|---:|---:|---:|---:|---:|
@@ -18,19 +18,57 @@
 | 14 | fused_allgather_with_matmul | 1024 | 7168 | 4096 | 1.222830 | 1.145781 | 1.851952 | 1.925677 |
 | 15 | fused_allgather_with_matmul | 1024 | 2560 | 5120 | 0.758725 | 0.752557 | 1.583705 | 1.568502 |
 | 16 | fused_allgather_with_matmul | 1024 | 12800 | 5120 | 1.799141 | 1.725152 | 1.965609 | 1.966107 |
-| 17 | fused_matmul_with_reducescatter | 8192 | 4096 | 1024 | 3.195523 | 2.923381 | 3.640402 | 3.550657 |
-| 18 | fused_matmul_with_reducescatter | 8192 | 4096 | 3584 | 4.865376 | 4.644224 | 5.474247 | 5.411646 |
-| 19 | fused_matmul_with_reducescatter | 8192 | 5120 | 2048 | 4.677040 | 4.453930 | 5.265272 | 5.150418 |
-| 20 | fused_matmul_with_reducescatter | 8192 | 5120 | 6400 | 8.372572 | 8.131182 | 8.881087 | 8.835794 |
-| 21 | fused_matmul_with_reducescatter | 4096 | 4096 | 1024 | 1.910327 | 1.666100 | 2.246750 | 1.927906 |
-| 22 | fused_matmul_with_reducescatter | 4096 | 4096 | 3584 | 2.654688 | 2.358557 | 3.242389 | 3.005879 |
-| 23 | fused_matmul_with_reducescatter | 4096 | 5120 | 2048 | 2.471633 | 2.262033 | 2.843113 | 2.763709 |
-| 24 | fused_matmul_with_reducescatter | 4096 | 5120 | 6400 | 4.303993 | 4.144023 | 4.607240 | 4.495861 |
-| 25 | fused_matmul_with_reducescatter | 2048 | 4096 | 1024 | 1.080043 | 0.926179 | 1.909816 | 1.768227 |
-| 26 | fused_matmul_with_reducescatter | 2048 | 4096 | 3584 | 1.943050 | 1.687472 | 1.789254 | 1.750970 |
-| 27 | fused_matmul_with_reducescatter | 2048 | 5120 | 2048 | 1.710010 | 1.532908 | 1.589988 | 1.482195 |
-| 28 | fused_matmul_with_reducescatter | 2048 | 5120 | 6400 | 2.341040 | 2.090016 | 2.484433 | 2.357400 |
-| 29 | fused_matmul_with_reducescatter | 1024 | 4096 | 1024 | 0.908987 | 0.794612 | 1.817336 | 1.810471 |
-| 30 | fused_matmul_with_reducescatter | 1024 | 4096 | 3584 | 1.286028 | 1.162980 | 1.835314 | 1.830718 |
-| 31 | fused_matmul_with_reducescatter | 1024 | 5120 | 2048 | 0.943306 | 0.802054 | 1.950669 | 1.900619 |
-| 32 | fused_matmul_with_reducescatter | 1024 | 5120 | 6400 | 1.555870 | 1.389414 | 1.479182 | 1.382537 |
+| 17 | fused_matmul_with_reducescatter | 8192 | 4096 | 1024 | 2.986178 | 2.902276 | 2.869079 | 2.773472 |
+| 18 | fused_matmul_with_reducescatter | 8192 | 4096 | 3584 | 4.676672 | 4.644146 | 3.491992 | 3.402984 |
+| 19 | fused_matmul_with_reducescatter | 8192 | 5120 | 2048 | 4.790053 | 4.452058 | 3.774670 | 3.642366 |
+| 20 | fused_matmul_with_reducescatter | 8192 | 5120 | 6400 | 8.175872 | 8.132254 | 6.463548 | 6.340126 |
+| 21 | fused_matmul_with_reducescatter | 4096 | 4096 | 1024 | 1.760580 | 1.619020 | 2.290772 | 2.194036 |
+| 22 | fused_matmul_with_reducescatter | 4096 | 4096 | 3584 | 2.378948 | 2.360592 | 2.130508 | 1.976910 |
+| 23 | fused_matmul_with_reducescatter | 4096 | 5120 | 2048 | 3.041922 | 2.510326 | 2.405640 | 1.934920 |
+| 24 | fused_matmul_with_reducescatter | 4096 | 5120 | 6400 | 4.322375 | 4.145284 | 3.357156 | 3.239444 |
+| 25 | fused_matmul_with_reducescatter | 2048 | 4096 | 1024 | 1.205953 | 1.028560 | 2.284532 | 2.181426 |
+| 26 | fused_matmul_with_reducescatter | 2048 | 4096 | 3584 | 1.828013 | 1.521286 | 2.202621 | 2.218710 |
+| 27 | fused_matmul_with_reducescatter | 2048 | 5120 | 2048 | 1.945154 | 1.639248 | 2.243862 | 2.180724 |
+| 28 | fused_matmul_with_reducescatter | 2048 | 5120 | 6400 | 2.577338 | 2.101736 | 1.854570 | 1.766050 |
+| 29 | fused_matmul_with_reducescatter | 1024 | 4096 | 1024 | 1.127480 | 0.923026 | 2.251246 | 2.257996 |
+| 30 | fused_matmul_with_reducescatter | 1024 | 4096 | 3584 | 1.195834 | 1.057758 | 2.251064 | 2.021760 |
+| 31 | fused_matmul_with_reducescatter | 1024 | 5120 | 2048 | 1.135134 | 1.044238 | 2.037672 | 1.985178 |
+| 32 | fused_matmul_with_reducescatter | 1024 | 5120 | 6400 | 1.276288 | 1.241812 | 2.173792 | 2.190292 |
+
+
+## 每个 run 的 fallback / symm ops 时间统计（单位: ms）- DLE 25.2.2
+| run_idx | op | M | N | K | fallback_mean | fallback_median | symm_mean | symm_median |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 | fused_allgather_with_matmul | 8192 | 1536 | 4096 | 3.638898 | 3.638920 | 2.715757 | 2.715752 |
+| 2 | fused_allgather_with_matmul | 8192 | 7168 | 4096 | 7.550689 | 7.550662 | 5.666549 | 5.666546 |
+| 3 | fused_allgather_with_matmul | 8192 | 2560 | 5120 | 5.416935 | 5.417015 | 3.478150 | 3.478147 |
+| 4 | fused_allgather_with_matmul | 8192 | 12800 | 5120 | 14.255692 | 14.255673 | 11.759356 | 11.759355 |
+| 5 | fused_allgather_with_matmul | 4096 | 1536 | 4096 | 1.863133 | 1.867696 | 1.425363 | 1.425381 |
+| 6 | fused_allgather_with_matmul | 4096 | 7168 | 4096 | 3.874199 | 3.874314 | 2.919173 | 2.919186 |
+| 7 | fused_allgather_with_matmul | 4096 | 2560 | 5120 | 2.702118 | 2.702064 | 1.789501 | 1.789512 |
+| 8 | fused_allgather_with_matmul | 4096 | 12800 | 5120 | 7.140684 | 7.140527 | 5.884243 | 5.884230 |
+| 9 | fused_allgather_with_matmul | 2048 | 1536 | 4096 | 0.983234 | 0.983141 | 1.456223 | 1.456991 |
+| 10 | fused_allgather_with_matmul | 2048 | 7168 | 4096 | 1.997938 | 2.003030 | 1.493615 | 1.493631 |
+| 11 | fused_allgather_with_matmul | 2048 | 2560 | 5120 | 1.363660 | 1.363572 | 1.099654 | 1.099647 |
+| 12 | fused_allgather_with_matmul | 2048 | 12800 | 5120 | 3.590295 | 3.590286 | 2.972277 | 2.972268 |
+| 13 | fused_allgather_with_matmul | 1024 | 1536 | 4096 | 0.609229 | 0.609036 | 1.108932 | 1.127440 |
+| 14 | fused_allgather_with_matmul | 1024 | 7168 | 4096 | 1.320503 | 1.327848 | 1.441028 | 1.442946 |
+| 15 | fused_allgather_with_matmul | 1024 | 2560 | 5120 | 0.947873 | 0.948468 | 1.448910 | 1.475056 |
+| 16 | fused_allgather_with_matmul | 1024 | 12800 | 5120 | 1.797537 | 1.797673 | 1.886329 | 1.886326 |
+| 17 | fused_matmul_with_reducescatter | 8192 | 4096 | 1024 | 3.472108 | 3.462982 | 2.816827 | 2.815478 |
+| 18 | *fused_matmul_with_reducescatter* | 8192 | 4096 | 3584 | 5.178662 | 5.184561 | 3.319928 | 3.325686 |
+| 19 | fused_matmul_with_reducescatter | 8192 | 5120 | 2048 | 5.093908 | 5.069415 | 3.609579 | 3.604559 |
+| 20 | fused_matmul_with_reducescatter | 8192 | 5120 | 6400 | 8.773580 | 8.773625 | 6.207282 | 6.208015 |
+| 21 | fused_matmul_with_reducescatter | 4096 | 4096 | 1024 | 2.223859 | 2.291281 | 1.827606 | 1.823679 |
+| 22 | fused_matmul_with_reducescatter | 4096 | 4096 | 3584 | 2.856573 | 2.849678 | 1.881230 | 1.882860 |
+| 23 | fused_matmul_with_reducescatter | 4096 | 5120 | 2048 | 2.654986 | 2.646192 | 1.879691 | 1.877811 |
+| 24 | fused_matmul_with_reducescatter | 4096 | 5120 | 6400 | 4.457216 | 4.447511 | 3.286830 | 3.294944 |
+| 25 | fused_matmul_with_reducescatter | 2048 | 4096 | 1024 | 1.138783 | 1.145448 | 1.646324 | 1.631677 |
+| 26 | fused_matmul_with_reducescatter | 2048 | 4096 | 3584 | 1.704915 | 1.738441 | 1.608015 | 1.605245 |
+| 27 | fused_matmul_with_reducescatter | 2048 | 5120 | 2048 | 1.662370 | 1.632935 | 1.529436 | 1.535916 |
+| 28 | fused_matmul_with_reducescatter | 2048 | 5120 | 6400 | 2.405447 | 2.399860 | 1.757331 | 1.769687 |
+| 29 | fused_matmul_with_reducescatter | 1024 | 4096 | 1024 | 0.806428 | 0.804950 | 1.531067 | 1.548537 |
+| 30 | fused_matmul_with_reducescatter | 1024 | 4096 | 3584 | 1.142868 | 1.141782 | 1.604227 | 1.616950 |
+| 31 | fused_matmul_with_reducescatter | 1024 | 5120 | 2048 | 1.004576 | 1.037678 | 1.848027 | 1.846931 |
+| 32 | fused_matmul_with_reducescatter | 1024 | 5120 | 6400 | 1.654418 | 1.644729 | 1.483491 | 1.485679 |
+
