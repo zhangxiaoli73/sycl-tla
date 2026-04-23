@@ -17,6 +17,17 @@ def proj_bf16_gemm(m, k, n):
     mem_time = (weights + output) * 2 / MemoryBW # Include write-back
     return max(compute_time, mem_time)
 
+def proj_allreduce(input_msg_size, intra_node_tp):
+    allreduce_time = 0
+    size_p2p = input_msg_size / intra_node_tp
+    time_p2p = (size_p2p / N_p2p_uni + N_lat) * 2
+    if time_p2p > input_msg_size / N_p2p_uni + N_lat:
+        time_p2p = input_msg_size / N_p2p_uni + N_lat
+    allreduce_time += time_p2p
+    reduction_time = input_msg_size / MemoryBW
+    allreduce_time += reduction_time
+    return allreduce_time
+
 def proj_allgather(input_msg_size, intra_node_tp):
     allgather_time = 0
     size_p2p = input_msg_size
