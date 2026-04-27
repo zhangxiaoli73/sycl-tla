@@ -9,7 +9,7 @@
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#include <Signal.hpp>
+#include "Signal.hpp"
 
 #include <cute/tensor.hpp>
 #include "cute/algorithm/gemm.hpp"
@@ -522,6 +522,13 @@ inline bool one_shot_wait_value(
 }
 
 constexpr int kFusedSignalBaseU32 = 512;
+constexpr int kOneShotMaxNumGroups = 256;
+
+template <typename T>
+constexpr int elems_per_vec() { return 32 / static_cast<int>(sizeof(T)); }
+
+template <typename T, int N>
+struct VecT { T data[N]; };
 
 template <typename scalar_t, int kWorldSize>
 struct FusedOneShotAllReduceSumKernel {
@@ -557,10 +564,8 @@ struct FusedOneShotAllReduceSumKernel {
             signal_pads, peer, /*region=*/0, group_id, my_rank);
         uint32_t* wait_addr = slot_of(
             signal_pads, my_rank, /*region=*/0, group_id, peer);
-       put_signal_impl_xpu<
-            std::memory_order_release>(put_addr);
-        wait_signal_impl_xpu<
-            std::memory_order_acquire>(wait_addr);
+        put_signal<std::memory_order_release>(put_addr);
+        wait_signal<std::memory_order_acquire>(wait_addr);
       }
     }
     // Gate the non-barrier threads in this WG on the signal exchange above.
@@ -584,10 +589,8 @@ struct FusedOneShotAllReduceSumKernel {
             signal_pads, peer, /*region=*/1, group_id, my_rank);
         uint32_t* wait_addr = slot_of(
             signal_pads, my_rank, /*region=*/1, group_id, peer);
-        ::c10d::symmetric_memory::put_signal<
-            std::memory_order_release>(put_addr);
-        ::c10d::symmetric_memory::wait_signal<
-            std::memory_order_acquire>(wait_addr);
+        put_signal<std::memory_order_release>(put_addr);
+        wait_signal<std::memory_order_acquire>(wait_addr);
       }
     }
     // No trailing item.barrier: nothing in this WG runs after the post

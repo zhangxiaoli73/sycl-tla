@@ -1,4 +1,4 @@
-#include <Signal.hpp>
+#include "Signal.hpp"
 #include <chrono>
 
 struct barrierKernel {

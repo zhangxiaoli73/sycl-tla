@@ -1,6 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+
+#include <sycl/sycl.hpp>
 
 // =============================================================================
 // Signal primitives using store/load + atomic_fence

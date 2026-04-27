@@ -73,7 +73,7 @@ struct Runner {
 
   template <int NUM_PER_TH>
     void launch_one_shot_allreduce(
-      void** ipc_data_ptrs,
+      Element** ipc_data_ptrs,
       uint32_t** ipc_signal_ptrs,
       Element* local_slot, //local symm data
       Element const* local_input,
@@ -108,30 +108,50 @@ struct Runner {
     int auto_max_blocks = std::max(1, static_cast<int>(
       q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
     int max_blocks = (cfg_max_blocks > 0) ? cfg_max_blocks : auto_max_blocks;
-    blocks = std::min<int64_t>(blocks, max_blocks);
+    blocks = std::min<int64_t>(blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
     int64_t global_size = blocks * wg_size;
 
-    // Submit kernel with explicit workgroup size for better occupancy
-    q_->submit([&](sycl::handler& h) {
-      h.parallel_for<StandaloneOneShotAllreduceKernelName<NUM_PER_TH>>(
-          sycl::nd_range<1>(
-              sycl::range<1>(static_cast<size_t>(global_size)),
-              sycl::range<1>(static_cast<size_t>(wg_size))),
-          [=](sycl::nd_item<1> item) {
-            one_shot_allreduce_device<NUM_PER_TH>(
-                item,
+    // Publish local input into symmetric slot so peers can read it via IPC
+    q_->memcpy(local_slot, local_input, static_cast<size_t>(n_elems) * sizeof(Element));
+
+    auto do_submit = [&](auto ws_const) {
+      constexpr int kWS = decltype(ws_const)::value;
+      q_->submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(global_size)),
+                sycl::range<1>(static_cast<size_t>(wg_size))),
+            FusedOneShotAllReduceSumKernel<Element, kWS>{
                 ipc_data_ptrs,
+                out,
                 ipc_signal_ptrs,
-                reinterpret_cast<SyclBF16*>(local_slot),
-                reinterpret_cast<SyclBF16 const*>(local_input),
-                reinterpret_cast<SyclBF16*>(out),
-                rank,
-                world_size,
+                /*input_offset=*/0,
                 n_elems,
-                dev_error,
-                signal_token);
-          });
-    });
+                rank});
+      });
+    };
+
+    switch (world_size) {
+      case 1:  do_submit(std::integral_constant<int,  1>{}); break;
+      case 2:  do_submit(std::integral_constant<int,  2>{}); break;
+      case 3:  do_submit(std::integral_constant<int,  3>{}); break;
+      case 4:  do_submit(std::integral_constant<int,  4>{}); break;
+      case 5:  do_submit(std::integral_constant<int,  5>{}); break;
+      case 6:  do_submit(std::integral_constant<int,  6>{}); break;
+      case 7:  do_submit(std::integral_constant<int,  7>{}); break;
+      case 8:  do_submit(std::integral_constant<int,  8>{}); break;
+      case 9:  do_submit(std::integral_constant<int,  9>{}); break;
+      case 10: do_submit(std::integral_constant<int, 10>{}); break;
+      case 11: do_submit(std::integral_constant<int, 11>{}); break;
+      case 12: do_submit(std::integral_constant<int, 12>{}); break;
+      case 13: do_submit(std::integral_constant<int, 13>{}); break;
+      case 14: do_submit(std::integral_constant<int, 14>{}); break;
+      case 15: do_submit(std::integral_constant<int, 15>{}); break;
+      case 16: do_submit(std::integral_constant<int, 16>{}); break;
+      default:
+        throw std::runtime_error(
+            "FusedOneShotAllReduceSumKernel: world_size must be in [1, 16].");
+    }
   }
 
   bool run(Options const& options, sycl::device const& device, int rank, int world_size) {
@@ -177,8 +197,9 @@ struct Runner {
     int max_blocks = (options.max_blocks > 0) ? options.max_blocks : auto_max_blocks;
     int64_t vec_elems = n_elems / BF16_VEC;
     int64_t required_blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    int64_t launch_blocks = std::min<int64_t>(required_blocks, max_blocks);
-    size_t signal_pad_elems = static_cast<size_t>(launch_blocks) * static_cast<size_t>(world_size);
+    int64_t launch_blocks = std::min<int64_t>(required_blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
+    size_t signal_pad_elems = static_cast<size_t>(kFusedSignalBaseU32) +
+                              2u * static_cast<size_t>(kOneShotMaxNumGroups) * static_cast<size_t>(world_size);
     std::cout << "Symm data elements: " << total_data_elems << ", signal pad elemements: " << signal_pad_elems << std::endl;
 
     if (!symm_) {
@@ -216,17 +237,18 @@ struct Runner {
     // remote_data_ptrs_[r] is the IPC-mapped base of peer r's local_data_ptr_.
     // Rank r wrote its data at base + r * per_rank_elems, so we adjust each pointer
     // so that slot_ptrs[r] points directly at the data that rank r produced.
-    std::vector<void*> host_slot_ptrs(world_size);
+    std::vector<Element*> host_slot_ptrs(world_size);
     for (int r = 0; r < world_size; ++r) {
       uint8_t* base = reinterpret_cast<uint8_t*>(symm_->remote_data_ptrs_[r]);
-      host_slot_ptrs[r] = base + static_cast<size_t>(r) * per_rank_elems * sizeof(Element);
+      host_slot_ptrs[r] = reinterpret_cast<Element*>(
+          base + static_cast<size_t>(r) * per_rank_elems * sizeof(Element));
     }
-    void** dev_slot_ptrs = sycl::malloc_device<void*>(static_cast<size_t>(world_size), *q_);
+    Element** dev_slot_ptrs = sycl::malloc_device<Element*>(static_cast<size_t>(world_size), *q_);
     if (dev_slot_ptrs == nullptr) {
       throw std::runtime_error("Failed to allocate dev_slot_ptrs.");
     }
     q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
-               static_cast<size_t>(world_size) * sizeof(void*)).wait();
+               static_cast<size_t>(world_size) * sizeof(Element*)).wait();
 
     static_assert(ALIGNMENT_BYTES % sizeof(Element) == 0,
             "ALIGNMENT_BYTES must be divisible by element size");

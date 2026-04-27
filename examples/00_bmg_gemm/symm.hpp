@@ -21,6 +21,7 @@
 #include <unistd.h>
 #endif
 
+#include "Signal.hpp"
 #include "ipc.hpp"
 
 #define ZE_CHECK(cmd) do {                             \
@@ -108,20 +109,6 @@ inline void close_ipc_ptrs(sycl::queue& q, std::vector<void*>& opened_ptrs) {
     ze_close_ipc_handle(ctx, p);
   }
   opened_ptrs.clear();
-}
-
-// --------------- Signal primitives (following torch-xpu-ops) ---------------
-// Uses store/load + atomic_fence (sycl::atomic_ref not supported on all targets)
-
-inline void store_release(uint32_t* addr, uint32_t val) {
-  *addr = val;
-  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-}
-
-inline uint32_t load_acquire(uint32_t* addr) {
-  sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-  uint32_t val = *addr;
-  return val;
 }
 
 // put_signal: wait until addr == 0, then set to 1 (release semantics)
