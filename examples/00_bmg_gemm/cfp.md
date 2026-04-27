@@ -1,7 +1,6 @@
 
 ## PyTorch Distributed on Intel XPU: From Native Communication to GEMM-Collective Overlap
 
-Distributed computing is essential for modern AI at scale. We bring distributed support to Intel XPUs by implementing XCCL backend in TorchComms, delivering oneCCL collectives and symmetric-memory custom collectives.
-Beyond basic collectives, computation-communication overlap futher reduces overhead. We enable async tensor parallelism on Intel XPUs with pipelined AllGather+GEMM and GEMM+ReduceScatter ops across multiple precisions for training and inference.
-Moving beyond Python-level ops, we introduce a native SYCL-TLA overlap path for Intel GPUs. The design uses a heuristic policy to select pull or push by platform bandwidth profile, supports PCIe and high-bandwidth interconnect topologies, tunes pipeline depth by workload, and falls back when overlap is not beneficial. This design also opens the door to future scale-out support. In practice, we validate this path in vLLM serving (Llama, Qwen) on Intel Arc B-Series, with notable performance gains in initial tests.
-
+As client GPUs such as Intel Arc B-series evolve, workloads increasingly exceed single-device capacity and require distributed execution. We enable this on Intel client GPUs (dGPUs and iGPUs) via an XCCL backend in TorchComms, providing oneCCL-based and custom symmetric-memory collectives.
+We further reduce communication overhead via computation–communication overlap, enabling asynchronous tensor parallelism on Intel GPUs with pipelined AllGather+GEMM and GEMM+ReduceScatter ops for training and inference across multiple precisions.
+Moving beyond Python-level ops, we introduce a native SYCL-TLA overlap path for Intel GPUs. It uses a heuristic policy to select pull or push based on bandwidth, supports PCIe and high-bandwidth interconnects, adapts pipeline depth to workload, and falls back when overlap is not beneficial. This design enables future scale-out support on CRI platforms. We validate it in vLLM serving (Llama, Qwen) on Intel Arc B-series, showing notable performance gains.
