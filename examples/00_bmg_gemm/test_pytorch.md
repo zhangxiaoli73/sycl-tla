@@ -4,7 +4,7 @@
 
 ### fused_allgather_with_matmul
 
-| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | overlap DLE25.2.1 (ms) | projection overlap (ms) |
+| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | sycl-tla DLE25.2.1 (ms) | projection overlap (ms) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8192 | 1536 | 4096 | 2.963619 | 2.603876 | 3.551714 | 2.574184 | 2.4032 | 2.059940 |
 | 8192 | 7168 | 4096 | 6.862932 | 5.381178 | 7.457438 | 5.293707 | 5.2978 | 4.945820 |
@@ -17,7 +17,7 @@
 
 ### fused_matmul_with_reducescatter
 
-| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | overlap DLE25.2.1 (ms) | projection overlap (ms) |
+| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | sycl-tla DLE25.2.1 (ms) | projection overlap (ms) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8192 | 5120 | 2048 | 4.439708 | 3.602394 | 4.990534 | 3.434959 | 3.0557 | 2.868650 |
 | 8192 | 5120 | 6400 | 8.100898 | 6.239371 | 8.671733 | 6.061744 | 6.2066 | 5.711290 |
@@ -32,7 +32,7 @@
 
 ### fused_allgather_with_matmul
 
-| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | overlap DLE25.2.1 (ms) | projection overlap (ms) |
+| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | sycl-tla DLE25.2.1 (ms) | projection overlap (ms) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8192 | 2560 | 5120 | 4.559499 | 3.368057 | 5.504952 | 3.298412 | 3.2238 | 2.791810 |
 | 8192 | 12800 | 5120 | 13.396760 | 11.402023 | 14.143189 | 12.003846 | 11.5557 | 11.003150 |
@@ -45,7 +45,7 @@
 
 ### fused_matmul_with_reducescatter
 
-| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | overlap DLE25.2.1 (ms) | projection overlap (ms) |
+| M | N | K | fallback_avg_min 25.3.2 (ms) | symm_avg_min 25.3.2 (ms) | fallback_avg_min 25.2.2 (ms) | symm_avg_min 25.2.2 (ms) | sycl-tla DLE25.2.1 (ms) | projection overlap (ms) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8192 | 4096 | 1024 | 2.890768 | 2.792436 | 3.310809 | 2.697999 | 2.2747 | 2.121420 |
 | 8192 | 4096 | 3584 | 4.640397 | 3.375923 | 5.059444 | 3.192524 | 2.9308 | 2.640680 |
@@ -59,9 +59,21 @@
 ## Q & A
 ### For op fusion， why pytorch 25.3.2 is worse than 25.2.2?
 
-### For native op， why pytorch 25.3.2 is worse than 25.2.2?
+case1：gemm + reducescatter | 8192 | 5120 | 2048 | 4.439708 | 3.602394 | 4.990534 | 3.434959 | 3.0557 | 2.868650 |
+case2：allgather + gemm | 2048 | 2560 | 5120 | 1.359852 | 1.933097 | 1.441024 | 1.405986 | 0.8684 | 0.704700 |
+
+
+### For native op， why pytorch 25.3.2 is better than 25.2.2?
+
+case1: allgather + gemm | 8192 | 1536 | 4096 | 2.963619 | 2.603876 | 3.551714 | 2.574184 | 2.4032 | 2.059940 |
+case2: gemm+reducescatter | 8192 | 4096 | 1024 | 2.890768 | 2.792436 | 3.310809 | 2.697999 | 2.2747 | 2.121420 |
+
 
 ### Why python fusion OP is much worse than sycl-tla?
 
-### For crossing UPI, performance?
+case1: allgather + gemm | 1024 | 1536 | 4096 | 0.730115 | 1.894856 | 0.616786 | 1.249303 | 0.3755 | 0.265370 |
+case2: allgather + gemm | 1024 | 2560 | 5120 | 0.753095 | 1.795952 | 0.777057 | 1.278059 | 0.4574 | 0.356850 |
+case3: gemm+reducescatter | 1024 | 4096 | 3584 | 1.021322 | 2.108907 | 0.944403 | 1.679564 | 0.5441 | 0.330090 |
 
+### For crossing UPI, performance?
+TBD
