@@ -110,10 +110,11 @@ struct Runner {
     int max_blocks = (cfg_max_blocks > 0) ? cfg_max_blocks : auto_max_blocks;
     blocks = std::min<int64_t>(blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
     int64_t global_size = blocks * wg_size;
-
-    // Publish local input into symmetric slot so peers can read it via IPC
-    q_->memcpy(local_slot, local_input, static_cast<size_t>(n_elems) * sizeof(Element));
-
+    std::cout << "Launching one-shot allreduce with global_size=" << global_size
+              << " wg_size=" << wg_size
+              << " blocks=" << blocks
+              << std::endl;
+    
     auto do_submit = [&](auto ws_const) {
       constexpr int kWS = decltype(ws_const)::value;
       q_->submit([&](sycl::handler& h) {

@@ -111,6 +111,9 @@ struct GemmAllreduceParams {
   // Monotonic per-launch token for flag synchronization.
   // Producer writes signal_token; consumer waits for exact match.
   uint32_t signal_token;
+
+  // Reducer workgroup configuration
+  int max_active_reducer_wgs;  // Maximum number of active reducer WGs (for tuning)
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -338,6 +341,13 @@ inline void reducer_work(
   int local_id = int(item.get_local_id(0));
   int wg_size = int(item.get_local_range(0));
 
+  // Keep only a small set of reducer workgroups active.
+  // This reduces spin-wait pressure from many early-arriving WGs.
+  int active_reducer_wgs = std::min(params.num_reducer_wgs, params.max_active_reducer_wgs);
+  if (reducer_id >= active_reducer_wgs) {
+    return;
+  }
+
   constexpr int NUM_PER_TH = 4;  // 4 × int64_t = 32 bytes = 16 bf16
   constexpr int BF16_PER_VEC = NUM_PER_TH * 4;  // 16 bf16 per vector load
 
@@ -345,15 +355,27 @@ inline void reducer_work(
   using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
 
   auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
+  auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
   int64_t rank_slot_vec_stride = (static_cast<int64_t>(params.M) * params.N) / BF16_PER_VEC;
+  int64_t rank_slot_elem_stride = static_cast<int64_t>(params.M) * params.N;
 
   int tile_m_size = 256;
   int tile_n_size = 256;
 
   for (int tile_idx = reducer_id; tile_idx < total_output_tiles;
-       tile_idx += params.num_reducer_wgs) {
+       tile_idx += active_reducer_wgs) {
     int tile_m = tile_idx / params.num_n_tiles;
     int tile_n = tile_idx % params.num_n_tiles;
+
+    int tile_m_base = tile_m * tile_m_size;
+    int tile_n_base = tile_n * tile_n_size;
+    if (tile_m_base >= params.M || tile_n_base >= params.N) {
+      continue;
+    }
+
+    int tile_rows = std::min(tile_m_size, params.M - tile_m_base);
+    int tile_cols = std::min(tile_n_size, params.N - tile_n_base);
+    int64_t tile_elems = static_cast<int64_t>(tile_rows) * tile_cols;
 
     // Step 1: Poll flags — wait for all ranks to complete this tile
     if (local_id == 0) {
@@ -371,36 +393,57 @@ inline void reducer_work(
     }
     sycl::group_barrier(item.get_group());
 
-    // Step 2: Vectorized reduction across all world_size data slots for this tile
-    int64_t tile_elems = static_cast<int64_t>(tile_m_size) * tile_n_size;
+    // Step 2: Reduce this tile with one-shot style rank rotation.
+    // Vector path handles aligned chunks; lane-0 handles scalar tail.
     int64_t vec_elems = tile_elems / BF16_PER_VEC;
 
     for (int64_t vi = local_id; vi < vec_elems; vi += wg_size) {
-      // Compute the bf16 element index within the tile
       int64_t bf16_idx = vi * BF16_PER_VEC;
-      int row = static_cast<int>(bf16_idx / tile_n_size);
-      int col = static_cast<int>(bf16_idx % tile_n_size);
-      int64_t global_offset = (static_cast<int64_t>(tile_m) * tile_m_size + row) * params.N
-                            + static_cast<int64_t>(tile_n) * tile_n_size + col;
+      int row = static_cast<int>(bf16_idx / tile_cols);
+      int col = static_cast<int>(bf16_idx % tile_cols);
+      int64_t global_offset =
+          (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
       int64_t global_vec_offset = global_offset / BF16_PER_VEC;
 
-      // Load from rank 0's slot
-      auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[0]);
-      BF16Vec sum = buf0[global_vec_offset].template as<BF16Vec>();
+      int src0 = params.my_rank;
+      auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src0]);
+      BF16Vec sum = buf0[static_cast<int64_t>(src0) * rank_slot_vec_stride + global_vec_offset]
+                        .template as<BF16Vec>();
 
-      // Accumulate from remaining ranks
+      // Rank rotation matches one-shot allreduce read order.
       #pragma unroll 8
-      for (int src = 1; src < params.world_size; ++src) {
+      for (int step = 1; step < params.world_size; ++step) {
+        int src = (params.my_rank + step) % params.world_size;
         auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
-        int64_t slot_vec_offset = static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset;
-        sum += buf[slot_vec_offset].template as<BF16Vec>();
+        sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset]
+                   .template as<BF16Vec>();
       }
 
-      // Store reduced result to D
       out_vec[global_vec_offset] = sum.template as<LoadVec>();
     }
 
-    sycl::group_barrier(item.get_group());
+    if (local_id == 0) {
+      int64_t scalar_begin = vec_elems * BF16_PER_VEC;
+      for (int64_t i = scalar_begin; i < tile_elems; ++i) {
+        int row = static_cast<int>(i / tile_cols);
+        int col = static_cast<int>(i % tile_cols);
+        int64_t global_offset =
+            (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
+
+        int src0 = params.my_rank;
+        auto* buf0 = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src0]);
+        float acc = static_cast<float>(
+            buf0[static_cast<int64_t>(src0) * rank_slot_elem_stride + global_offset]);
+
+        for (int step = 1; step < params.world_size; ++step) {
+          int src = (params.my_rank + step) % params.world_size;
+          auto* buf = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src]);
+          acc += static_cast<float>(
+              buf[static_cast<int64_t>(src) * rank_slot_elem_stride + global_offset]);
+        }
+        out_scalar[global_offset] = static_cast<SyclBF16>(acc);
+      }
+    }
 
     // No flag clear is needed with token-based synchronization.
   }
@@ -452,9 +495,10 @@ void gemm_allreduce_device(
   // Keep pull-only behavior in gemm_allreduce_device path.
   params.use_push_mode = false;
   params.signal_token = signal_token;
+  params.max_active_reducer_wgs = 8;  // Configurable limit on active reducer WGs
 
-  gemm_and_push(A, B, C, mma, alpha, params);
-  sycl::group_barrier(item.get_group());
+  // gemm_and_push(A, B, C, mma, alpha, params);
+  // sycl::group_barrier(item.get_group());
   reducer_work(item, reducer_id, params);
 }
 
