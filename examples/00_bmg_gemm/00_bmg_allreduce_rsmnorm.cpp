@@ -26,6 +26,8 @@ struct Options {
   int n = 4096;
   int iterations = 20;
   int verify = 1;
+  int wg_size = 0;      // 0 = auto
+  int max_blocks = 0;   // 0 = auto
 
   void parse(int argc, char** argv) {
     std::vector<char const*> cargs(argc);
@@ -43,6 +45,8 @@ struct Options {
     cmd.get_cmd_line_argument("n", n, 4096);
     cmd.get_cmd_line_argument("iterations", iterations, 20);
     cmd.get_cmd_line_argument("verify", verify, 1);
+    cmd.get_cmd_line_argument("wg_size", wg_size, 0);
+    cmd.get_cmd_line_argument("max_blocks", max_blocks, 0);
   }
 
   std::ostream& print_usage(std::ostream& out) const {
@@ -50,11 +54,12 @@ struct Options {
         << "  --m=<int>            rows (default 8192)\\n"
         << "  --n=<int>            cols (default 4096)\\n"
         << "  --iterations=<int>   benchmark iterations (default 20)\\n"
-        << "  --verify=<int>       0/1 verify output (default 1)\\n\\n"
+        << "  --verify=<int>       0/1 verify output (default 1)\\n"
+        << "  --wg_size=<int>      work-group size, 0=auto (default 0)\\n"
+        << "  --max_blocks=<int>   launch blocks cap, 0=auto (default 0)\\n\\n"
         << "Constraints:\\n"
-        << "  - This one-shot path is vector-only. m * n must be divisible by NUM_PER_TH * 4\\n"
-        << "    bf16 elements. With the current build-time setting NUM_PER_TH=4, m * n must be\\n"
-        << "    divisible by 16.\\n\\n";
+        << "  - This one-shot path is vector-only. m * n must be divisible by alignment/sizeof(bf16).\\n"
+        << "    With current build-time alignment=32 bytes, m * n must be divisible by 16.\\n\\n";
     return out;
   }
 };
@@ -62,13 +67,56 @@ struct Options {
 template <int NUM_PER_TH>
 class StandaloneOneShotAllreduceKernelName;
 
+// ─── RMS Norm Kernel ───────────────────────────────────────────────────────────
+// Applies per-row RMS normalization: out[i,j] = in[i,j] / rms(row_i) * weight[j]
+// where rms(row) = sqrt(mean(x^2) + eps).  Each work-group handles one row.
+template <typename T>
+struct RmsNormKernel {
+  T const* input;
+  T const* weight;
+  T*       output;
+  int64_t  m;
+  int64_t  n;
+  float    eps;
+
+  void operator()(sycl::nd_item<1> item) const {
+    int64_t row     = static_cast<int64_t>(item.get_group(0));
+    int64_t tid     = static_cast<int64_t>(item.get_local_id(0));
+    int64_t wg_size = static_cast<int64_t>(item.get_local_range(0));
+
+    if (row >= m) return;
+
+    T const* row_in  = input  + row * n;
+    T*       row_out = output + row * n;
+
+    // Accumulate partial sum of squares.
+    float partial_ss = 0.0f;
+    for (int64_t j = tid; j < n; j += wg_size) {
+      float x = static_cast<float>(row_in[j]);
+      partial_ss += x * x;
+    }
+
+    // Work-group reduction.
+    sycl::group<1> g = item.get_group();
+    float total_ss = sycl::reduce_over_group(g, partial_ss, sycl::plus<float>{});
+    float rms_inv  = sycl::rsqrt(total_ss / static_cast<float>(n) + eps);
+
+    // Write normalized output.
+    for (int64_t j = tid; j < n; j += wg_size) {
+      float x = static_cast<float>(row_in[j]);
+      float w = static_cast<float>(weight[j]);
+      row_out[j] = static_cast<T>(x * rms_inv * w);
+    }
+  }
+};
+
 struct Runner {
   std::unique_ptr<sycl::queue> q_;
   std::unique_ptr<SymmMemory> symm_;
 
   template <int NUM_PER_TH>
     void launch_one_shot_allreduce(
-      void** ipc_data_ptrs,
+      Element** ipc_data_ptrs,
       uint32_t** ipc_signal_ptrs,
       Element* local_slot, //local symm data
       Element const* local_input,
@@ -77,45 +125,103 @@ struct Runner {
       int rank,
       int world_size,
       int64_t n_elems,
-      uint32_t signal_token) {
+      uint32_t signal_token,
+      int cfg_wg_size,
+      int cfg_max_blocks) {
 
     constexpr int BF16_PER_I64 = 4;
-    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
+    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;  // bf16 elements per thread vector op
 
     if ((n_elems % BF16_VEC) != 0) {
       throw std::runtime_error(
         "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
     }
 
+    // Thread sizing (inspired by CUDA one-shot: target ~512 threads to limit register pressure)
     int dev_max_wg = static_cast<int>(
         q_->get_device().get_info<sycl::info::device::max_work_group_size>());
-    // int wg_size = std::max(64, std::min(dev_max_wg, 256));
-    const int wg_size = static_cast<int>(q_->get_device().get_info<sycl::info::device::max_work_group_size>()) / BF16_VEC;
+    int auto_wg_size = std::min(dev_max_wg, 256);
+    int wg_size = (cfg_wg_size > 0) ? std::min(dev_max_wg, cfg_wg_size) : auto_wg_size;
+    if (wg_size <= 0) {
+      throw std::runtime_error("Invalid wg_size after device clamp.");
+    }
 
     int64_t vec_elems = n_elems / BF16_VEC;
     int64_t blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    blocks = std::min<int64_t>(blocks, 32);
+    int auto_max_blocks = std::max(1, static_cast<int>(
+      q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
+    int max_blocks = (cfg_max_blocks > 0) ? cfg_max_blocks : auto_max_blocks;
+    blocks = std::min<int64_t>(blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
     int64_t global_size = blocks * wg_size;
+    std::cout << "Launching one-shot allreduce with global_size=" << global_size
+              << " wg_size=" << wg_size
+              << " blocks=" << blocks
+              << std::endl;
+    
+    auto do_submit = [&](auto ws_const) {
+      constexpr int kWS = decltype(ws_const)::value;
+      q_->submit([&](sycl::handler& h) {
+        h.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<size_t>(global_size)),
+                sycl::range<1>(static_cast<size_t>(wg_size))),
+            FusedOneShotAllReduceSumKernel<Element, kWS>{
+                ipc_data_ptrs,
+                out,
+                ipc_signal_ptrs,
+                /*input_offset=*/0,
+                n_elems,
+                rank});
+      });
+    };
+
+    switch (world_size) {
+      case 1:  do_submit(std::integral_constant<int,  1>{}); break;
+      case 2:  do_submit(std::integral_constant<int,  2>{}); break;
+      case 3:  do_submit(std::integral_constant<int,  3>{}); break;
+      case 4:  do_submit(std::integral_constant<int,  4>{}); break;
+      case 5:  do_submit(std::integral_constant<int,  5>{}); break;
+      case 6:  do_submit(std::integral_constant<int,  6>{}); break;
+      case 7:  do_submit(std::integral_constant<int,  7>{}); break;
+      case 8:  do_submit(std::integral_constant<int,  8>{}); break;
+      case 9:  do_submit(std::integral_constant<int,  9>{}); break;
+      case 10: do_submit(std::integral_constant<int, 10>{}); break;
+      case 11: do_submit(std::integral_constant<int, 11>{}); break;
+      case 12: do_submit(std::integral_constant<int, 12>{}); break;
+      case 13: do_submit(std::integral_constant<int, 13>{}); break;
+      case 14: do_submit(std::integral_constant<int, 14>{}); break;
+      case 15: do_submit(std::integral_constant<int, 15>{}); break;
+      case 16: do_submit(std::integral_constant<int, 16>{}); break;
+      default:
+        throw std::runtime_error(
+            "FusedOneShotAllReduceSumKernel: world_size must be in [1, 16].");
+    }
+  }
+
+  // ─── RMS Norm launcher ─────────────────────────────────────────────────────
+  void launch_rms_norm(
+      Element const* input,
+      Element const* weight,
+      Element*       output,
+      int64_t        m,
+      int64_t        n,
+      float          eps,
+      int            cfg_wg_size) {
+
+    int dev_max_wg = static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_work_group_size>());
+    // Choose wg_size to cover the row (up to dev max), rounded down to power of 2.
+    int raw = (cfg_wg_size > 0) ? std::min(dev_max_wg, cfg_wg_size)
+                                : std::min(dev_max_wg, static_cast<int>(n));
+    int wg_size = 1;
+    while (wg_size * 2 <= raw) wg_size *= 2;
 
     q_->submit([&](sycl::handler& h) {
-      h.parallel_for<StandaloneOneShotAllreduceKernelName<NUM_PER_TH>>(
+      h.parallel_for(
           sycl::nd_range<1>(
-              sycl::range<1>(static_cast<size_t>(global_size)),
+              sycl::range<1>(static_cast<size_t>(m) * static_cast<size_t>(wg_size)),
               sycl::range<1>(static_cast<size_t>(wg_size))),
-          [=](sycl::nd_item<1> item) {
-            one_shot_allreduce_device<NUM_PER_TH>(
-                item,
-                ipc_data_ptrs,
-                ipc_signal_ptrs,
-                reinterpret_cast<SyclBF16*>(local_slot),
-                reinterpret_cast<SyclBF16 const*>(local_input),
-                reinterpret_cast<SyclBF16*>(out),
-                rank,
-                world_size,
-                n_elems,
-                dev_error,
-                signal_token);
-          });
+          RmsNormKernel<Element>{input, weight, output, m, n, eps});
     });
   }
 
@@ -137,22 +243,35 @@ struct Runner {
 
     // one_shot_signal_sync indexes signal pad as [block_id * world_size + rank],
     // so signal pad storage must cover all launched blocks.
-    constexpr int NUM_PER_TH = 4;
+    constexpr int ALIGNMENT_BYTES = 32;
     constexpr int BF16_PER_I64 = 4;
+    constexpr int ELEM_PER_THREAD = ALIGNMENT_BYTES / sizeof(Element);
+    static_assert((ELEM_PER_THREAD % 4) == 0,
+                  "ELEM_PER_THREAD must be divisible by 4 for VecI64 packing");
+    constexpr int NUM_PER_TH = ELEM_PER_THREAD / 4;
     constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
+
     if ((n_elems % BF16_VEC) != 0) {
       throw std::runtime_error(
           "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
     }
-    int wg_size = static_cast<int>(
-        q_->get_device().get_info<sycl::info::device::max_work_group_size>()) / BF16_VEC;
+
+    int dev_max_wg = static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_work_group_size>());
+    int auto_wg_size = std::min(dev_max_wg, 256);
+    int wg_size = (options.wg_size > 0) ? std::min(dev_max_wg, options.wg_size) : auto_wg_size;
     if (wg_size <= 0) {
-      throw std::runtime_error("Invalid wg_size for one-shot allreduce.");
+      throw std::runtime_error("Invalid wg_size after device clamp.");
     }
+    int auto_max_blocks = std::max(1, static_cast<int>(
+        q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
+    int max_blocks = (options.max_blocks > 0) ? options.max_blocks : auto_max_blocks;
     int64_t vec_elems = n_elems / BF16_VEC;
-    int64_t blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    blocks = std::min<int64_t>(blocks, 32);
-    size_t signal_pad_elems = static_cast<size_t>(blocks) * static_cast<size_t>(world_size);
+    int64_t required_blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
+    int64_t launch_blocks = std::min<int64_t>(required_blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
+    size_t signal_pad_elems = static_cast<size_t>(kFusedSignalBaseU32) +
+                              2u * static_cast<size_t>(kOneShotMaxNumGroups) * static_cast<size_t>(world_size);
+    std::cout << "Symm data elements: " << total_data_elems << ", signal pad elemements: " << signal_pad_elems << std::endl;
 
     if (!symm_) {
       symm_ = std::make_unique<SymmMemory>(
@@ -189,17 +308,30 @@ struct Runner {
     // remote_data_ptrs_[r] is the IPC-mapped base of peer r's local_data_ptr_.
     // Rank r wrote its data at base + r * per_rank_elems, so we adjust each pointer
     // so that slot_ptrs[r] points directly at the data that rank r produced.
-    std::vector<void*> host_slot_ptrs(world_size);
+    std::vector<Element*> host_slot_ptrs(world_size);
     for (int r = 0; r < world_size; ++r) {
       uint8_t* base = reinterpret_cast<uint8_t*>(symm_->remote_data_ptrs_[r]);
-      host_slot_ptrs[r] = base + static_cast<size_t>(r) * per_rank_elems * sizeof(Element);
+      host_slot_ptrs[r] = reinterpret_cast<Element*>(
+          base + static_cast<size_t>(r) * per_rank_elems * sizeof(Element));
     }
-    void** dev_slot_ptrs = sycl::malloc_device<void*>(static_cast<size_t>(world_size), *q_);
+    Element** dev_slot_ptrs = sycl::malloc_device<Element*>(static_cast<size_t>(world_size), *q_);
     if (dev_slot_ptrs == nullptr) {
       throw std::runtime_error("Failed to allocate dev_slot_ptrs.");
     }
     q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
-               static_cast<size_t>(world_size) * sizeof(void*)).wait();
+               static_cast<size_t>(world_size) * sizeof(Element*)).wait();
+
+    static_assert(ALIGNMENT_BYTES % sizeof(Element) == 0,
+            "ALIGNMENT_BYTES must be divisible by element size");
+
+    if (rank == 0) {
+      std::cout << "[one-shot] alignment=" << ALIGNMENT_BYTES
+                << "B, elements-per-thread=" << ELEM_PER_THREAD
+                << ", NUM_PER_TH=" << NUM_PER_TH
+                << ", wg_size=" << (options.wg_size > 0 ? options.wg_size : std::min(static_cast<int>(q_->get_device().get_info<sycl::info::device::max_work_group_size>()), 256))
+                << ", max_blocks=" << (options.max_blocks > 0 ? options.max_blocks : std::max(1, static_cast<int>(q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8))
+                << std::endl;
+    }
 
     uint32_t signal_token = 1;
     std::cout << "[rank " << rank << "] Starting one-shot allreduce warmup..." << std::endl;
@@ -215,7 +347,9 @@ struct Runner {
           rank,
           world_size,
           n_elems,
-          signal_token);
+          signal_token,
+          options.wg_size,
+          options.max_blocks);
       signal_token += 2;
       q_->wait();
       int host_error = 0;
@@ -227,8 +361,8 @@ struct Runner {
 
     std::cout << "[rank " << rank << "] Starting one-shot allreduce benchmark for "
               << options.iterations << " iterations..." << std::endl;
-    
-              q_->memset(dev_error, 0, sizeof(int)).wait();
+    q_->memset(dev_error, 0, sizeof(int)).wait();
+     MPI_Barrier(MPI_COMM_WORLD);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int iter = 0; iter < options.iterations; ++iter) {
       launch_one_shot_allreduce<NUM_PER_TH>(
@@ -241,8 +375,11 @@ struct Runner {
           rank,
           world_size,
           n_elems,
-          signal_token);
+          signal_token,
+          options.wg_size,
+          options.max_blocks);
       signal_token += 2;
+      MPI_Barrier(MPI_COMM_WORLD);
     }
     q_->wait();
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -258,13 +395,10 @@ struct Runner {
     double avg_ms = total_ms / std::max(1, options.iterations);
 
     if (true) {
-      double gb = static_cast<double>(n_elems * sizeof(Element) * (world_size + 1)) / 1e9;
-      double gbps = gb / (avg_ms / 1000.0);
       std::cout << "Allreduce one-shot standalone: m=" << m
                 << " n=" << n
                 << " world_size=" << world_size
-                << " avg_ms=" << avg_ms
-                << " BW=" << gbps << " GB/s" << std::endl;
+                << " avg_ms=" << avg_ms << std::endl;
     }
 
     bool passed = true;
@@ -309,6 +443,84 @@ struct Runner {
                 << " mismatch=" << mismatch << "/" << host_ref.size()
                 << std::endl;
     }
+
+    // ─── RMS Norm ────────────────────────────────────────────────────────────
+    constexpr float kRmsEps = 1e-6f;
+
+    Element* weight  = sycl::malloc_device<Element>(static_cast<size_t>(n), *q_);
+    Element* rms_out = sycl::malloc_device<Element>(static_cast<size_t>(n_elems), *q_);
+    if (weight == nullptr || rms_out == nullptr) {
+      throw std::runtime_error("Failed to allocate weight/rms_out buffers.");
+    }
+    // Initialize weight to 1.0 (identity scaling).
+    q_->submit([&](sycl::handler& h) {
+      h.parallel_for(sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+        weight[i] = static_cast<Element>(1.0f);
+      });
+    }).wait();
+
+    std::cout << "[rank " << rank << "] Starting RMS norm warmup..." << std::endl;
+    for (int i = 0; i < 5; ++i) {
+      launch_rms_norm(out, weight, rms_out, m, n, kRmsEps, options.wg_size);
+    }
+    q_->wait();
+
+    std::cout << "[rank " << rank << "] Starting RMS norm benchmark for "
+              << options.iterations << " iterations..." << std::endl;
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto t2 = std::chrono::high_resolution_clock::now();
+    for (int iter = 0; iter < options.iterations; ++iter) {
+      launch_rms_norm(out, weight, rms_out, m, n, kRmsEps, options.wg_size);
+    }
+    q_->wait();
+    auto t3 = std::chrono::high_resolution_clock::now();
+
+    double rms_total_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
+    double rms_avg_ms   = rms_total_ms / std::max(1, options.iterations);
+    std::cout << "RMS norm standalone: m=" << m
+              << " n=" << n
+              << " avg_ms=" << rms_avg_ms << std::endl;
+
+    if (options.verify != 0) {
+      std::vector<Element> h_in(static_cast<size_t>(n_elems));
+      std::vector<Element> h_rms(static_cast<size_t>(n_elems));
+      q_->memcpy(h_in.data(),  out,     static_cast<size_t>(n_elems) * sizeof(Element)).wait();
+      q_->memcpy(h_rms.data(), rms_out, static_cast<size_t>(n_elems) * sizeof(Element)).wait();
+
+      size_t rms_mismatch = 0;
+      double rms_max_abs  = 0.0;
+      double rms_max_rel  = 0.0;
+      for (int row = 0; row < m; ++row) {
+        double ss = 0.0;
+        for (int col = 0; col < n; ++col) {
+          double x = static_cast<double>(static_cast<float>(h_in[row * n + col]));
+          ss += x * x;
+        }
+        double rms_inv = 1.0 / std::sqrt(ss / static_cast<double>(n) +
+                                         static_cast<double>(kRmsEps));
+        for (int col = 0; col < n; ++col) {
+          double x   = static_cast<double>(static_cast<float>(h_in[row * n + col]));
+          double ref = x * rms_inv; // weight == 1
+          double got = static_cast<double>(static_cast<float>(h_rms[row * n + col]));
+          double diff = std::abs(ref - got);
+          double rel  = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
+          rms_max_abs = std::max(rms_max_abs, diff);
+          rms_max_rel = std::max(rms_max_rel, rel);
+          if (rel > 1e-2) ++rms_mismatch;
+        }
+      }
+      bool rms_passed = (rms_mismatch == 0);
+      passed = passed && rms_passed;
+      std::cout << "[rank " << rank << "] RMS norm verify "
+                << (rms_passed ? "PASSED" : "FAILED")
+                << " max_abs=" << rms_max_abs
+                << " max_rel=" << rms_max_rel
+                << " mismatch=" << rms_mismatch << "/" << n_elems
+                << std::endl;
+    }
+
+    sycl::free(weight,  *q_);
+    sycl::free(rms_out, *q_);
 
     sycl::free(dev_slot_ptrs, *q_);
     sycl::free(local_input, *q_);
