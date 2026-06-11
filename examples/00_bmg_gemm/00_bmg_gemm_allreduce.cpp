@@ -435,7 +435,9 @@ struct ExampleRunner {
 		int num_n_tiles = int(ceil_div(n, tile_n));
 
 		// Number of reducer WGs: configurable via CUTLASS_AR_NUM_REDUCER_WGS env var
-		int num_reducer_wgs = 8;  // default
+		// Must be limited to avoid deadlock: GEMM WGs + reducer WGs must fit in
+		// hardware simultaneously, otherwise reducers block GEMM from running.
+		int num_reducer_wgs = 8;  // default: safe for BMG (8 GEMM + 8 reducer = 16 WGs)
 		if (const char* env = std::getenv("CUTLASS_AR_NUM_REDUCER_WGS")) {
 			num_reducer_wgs = std::max(1, std::atoi(env));
 		}

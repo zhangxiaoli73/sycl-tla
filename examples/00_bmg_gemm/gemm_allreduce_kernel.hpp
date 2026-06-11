@@ -355,126 +355,90 @@ inline void reducer_work_subgroup(
     return;
   }
 
-  // Subgroup-level division:
-  // Each WG has multiple subgroups (wg_size / 16).
-  // Each subgroup independently handles a subset of tiles.
-  constexpr int SG_SIZE = 16;
-  int num_sgs_per_wg = wg_size / SG_SIZE;
-  int local_sg_id = local_id / SG_SIZE;
-  int lane_id = local_id % SG_SIZE;
-
-  // Global subgroup ID across all reducer WGs
-  int total_reducer_sgs = num_active_reducer_wgs * num_sgs_per_wg;
-  int global_sg_id = reducer_wg_id * num_sgs_per_wg + local_sg_id;
-
   constexpr int NUM_PER_TH = 4;  // 4 × int64_t = 32 bytes = 16 bf16
   constexpr int BF16_PER_VEC = NUM_PER_TH * 4;  // 16 bf16 per vector load
 
   using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
   using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
 
-  int tile_m_size = 256;
-  int tile_n_size = 256;
+  // --- Flat parallel strategy ---
+  // All reducer threads cooperate on the ENTIRE output matrix (M*N elements).
+  // Step 1: Thread 0 of WG 0 waits for ALL tiles to be ready.
+  // Step 2: All threads do flat-parallel reduction across the full output.
 
-  // Each subgroup processes tiles where tile_idx % total_reducer_sgs == global_sg_id
-  for (int tile_idx = global_sg_id; tile_idx < total_output_tiles;
-       tile_idx += total_reducer_sgs) {
-    int tile_m = tile_idx / params.num_n_tiles;
-    int tile_n = tile_idx % params.num_n_tiles;
+  int64_t total_elems = static_cast<int64_t>(params.M) * params.N;
+  int64_t total_vec_elems = total_elems / BF16_PER_VEC;
+  int64_t rank_slot_vec_stride = total_vec_elems;
+  int64_t rank_slot_elem_stride = total_elems;
 
-    int tile_m_base = tile_m * tile_m_size;
-    int tile_n_base = tile_n * tile_n_size;
-    if (tile_m_base >= params.M || tile_n_base >= params.N) {
-      continue;
-    }
-
-    int tile_rows = std::min(tile_m_size, params.M - tile_m_base);
-    int tile_cols = std::min(tile_n_size, params.N - tile_n_base);
-    int64_t tile_elems = static_cast<int64_t>(tile_rows) * tile_cols;
-
-    // Step 1: Spin check flags — wait for all ranks to complete this tile.
-    // Only lane 0 in the subgroup does the polling (flags are pushed to local).
-    if (lane_id == 0) {
+  // Step 1: All reducer WGs poll ALL tiles' flags.
+  // Each WG's thread 0 checks all flags — this ensures every WG knows all data is ready
+  // before any thread starts reduction.
+  if (local_id == 0) {
+    for (int tile_idx = 0; tile_idx < total_output_tiles; ++tile_idx) {
+      int tile_m = tile_idx / params.num_n_tiles;
+      int tile_n = tile_idx % params.num_n_tiles;
       for (int src = 0; src < params.world_size; ++src) {
         int flag_idx = src * params.num_m_tiles * params.num_n_tiles
                      + tile_m * params.num_n_tiles + tile_n;
-        // Flags were pushed to our local buffer by remote producers
         uint32_t* flag_ptr = &params.local_flags[flag_idx];
         while (allreduce_load_acquire_u32(flag_ptr) != params.signal_token) {
           // spin-wait
         }
       }
     }
+  }
 
-    // Subgroup barrier: ensure all lanes see the flag-ready state
-    // (implicit via subgroup execution model on Intel — all lanes in a
-    // subgroup execute in lockstep, so lane 0's spin exit gates all lanes)
+  // WG-level barrier: all threads in this WG wait until flags are confirmed
+  sycl::group_barrier(item.get_group());
 
-    // Step 2: Acquire fence after flags confirmed — ensures subsequent data
-    // reads see the data that was written before the flag.
-    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+  // Acquire fence: ensures subsequent data reads see committed data
+  sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
 
-    // Step 3: Each lane in the subgroup cooperatively reduces a portion of the tile.
-    // Lane i handles elements where elem_idx % SG_SIZE == lane_id.
-    int64_t vec_elems = tile_elems / BF16_PER_VEC;
-    int64_t rank_slot_vec_stride = (static_cast<int64_t>(params.M) * params.N) / BF16_PER_VEC;
-    int64_t rank_slot_elem_stride = static_cast<int64_t>(params.M) * params.N;
+  // Step 2: Flat parallel reduction — all reducer threads cooperate on full output
+  int64_t global_thread_id = static_cast<int64_t>(reducer_wg_id) * wg_size + local_id;
+  int64_t total_reducer_threads = static_cast<int64_t>(num_active_reducer_wgs) * wg_size;
 
-    auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
-    auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
+  auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
+  auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
 
-    // Each lane handles vec elements: lane_id, lane_id + SG_SIZE, ...
-    for (int64_t vi = lane_id; vi < vec_elems; vi += SG_SIZE) {
-      int64_t bf16_idx = vi * BF16_PER_VEC;
-      int row = static_cast<int>(bf16_idx / tile_cols);
-      int col = static_cast<int>(bf16_idx % tile_cols);
-      int64_t global_offset =
-          (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
-      int64_t global_vec_offset = global_offset / BF16_PER_VEC;
+  for (int64_t vi = global_thread_id; vi < total_vec_elems; vi += total_reducer_threads) {
+    // Start with own rank's data
+    int src0 = params.my_rank;
+    auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src0]);
+    BF16Vec sum = buf0[static_cast<int64_t>(src0) * rank_slot_vec_stride + vi]
+                      .template as<BF16Vec>();
 
-      // Start with own rank's data
-      int src0 = params.my_rank;
-      auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src0]);
-      BF16Vec sum = buf0[static_cast<int64_t>(src0) * rank_slot_vec_stride + global_vec_offset]
-                        .template as<BF16Vec>();
+    // Accumulate from all other ranks (rank rotation for balanced access)
+    #pragma unroll 8
+    for (int step = 1; step < params.world_size; ++step) {
+      int src = (params.my_rank + step) % params.world_size;
+      auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
+      sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride + vi]
+                 .template as<BF16Vec>();
+    }
 
-      // Accumulate from all other ranks (rank rotation for balanced access)
-      #pragma unroll 8
-      for (int step = 1; step < params.world_size; ++step) {
+    out_vec[vi] = sum.template as<LoadVec>();
+  }
+
+  // Scalar tail: thread 0 of WG 0 handles remainder
+  if (global_thread_id == 0) {
+    int64_t scalar_begin = total_vec_elems * BF16_PER_VEC;
+    for (int64_t i = scalar_begin; i < total_elems; ++i) {
+      float acc = 0.0f;
+      for (int step = 0; step < params.world_size; ++step) {
         int src = (params.my_rank + step) % params.world_size;
-        auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
-        sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset]
-                   .template as<BF16Vec>();
+        auto* buf = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src]);
+        acc += static_cast<float>(
+            buf[static_cast<int64_t>(src) * rank_slot_elem_stride + i]);
       }
-
-      out_vec[global_vec_offset] = sum.template as<LoadVec>();
+      out_scalar[i] = static_cast<SyclBF16>(acc);
     }
+  }
 
-    // Scalar tail: only lane 0 handles remainder
-    if (lane_id == 0) {
-      int64_t scalar_begin = vec_elems * BF16_PER_VEC;
-      for (int64_t i = scalar_begin; i < tile_elems; ++i) {
-        int row = static_cast<int>(i / tile_cols);
-        int col = static_cast<int>(i % tile_cols);
-        int64_t global_offset =
-            (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
-
-        float acc = 0.0f;
-        for (int step = 0; step < params.world_size; ++step) {
-          int src = (params.my_rank + step) % params.world_size;
-          auto* buf = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src]);
-          acc += static_cast<float>(
-              buf[static_cast<int64_t>(src) * rank_slot_elem_stride + global_offset]);
-        }
-        out_scalar[global_offset] = static_cast<SyclBF16>(acc);
-      }
-    }
-
-    // Debug log: tile reduction complete
-    if (debug_log && lane_id == 0) {
-      printf("[AR-REDUCE-TILE] rank=%d, sg=%d, tile(%d,%d) reduced, elems=%lld\n",
-             params.my_rank, global_sg_id, tile_m, tile_n, (long long)tile_elems);
-    }
+  if (debug_log && local_id == 0 && reducer_wg_id == 0) {
+    printf("[AR-REDUCE-FLAT] rank=%d, total_threads=%lld, vec_elems=%lld\n",
+           params.my_rank, (long long)total_reducer_threads, (long long)total_vec_elems);
   }
 }
 
