@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -21,9 +22,9 @@ using namespace cute;
 struct Options {
 	bool help = false;
 	bool error = false;
-	int m = 8192;
-	int n = 4096;
-	int k = 3584;
+	int m = 256; //8192;
+	int n = 2048; // hidden size
+	int k = 1536; // moe intermediate size
 	int iterations = 20;
 	int debug_log = 1;
 	int verify = 0;
@@ -138,7 +139,9 @@ struct ExampleRunner {
 			int rank,
 			int world_size,
 			int m,
-			int n) {
+			int n,
+			int num_reducer_wgs,
+			bool debug_log = false) {
 		namespace syclex = sycl::ext::oneapi::experimental;
 		namespace intelex = sycl::ext::intel::experimental;
 
@@ -153,7 +156,8 @@ struct ExampleRunner {
 			                              ipc_signal_ptrs, ipc_data_ptrs,
 				                              signal_token,
 				                              use_push_mode,
-				                              rank, world_size, m, n, num_n_tiles);
+				                              rank, world_size, m, n, num_n_tiles,
+				                              num_reducer_wgs, debug_log);
 			    });
 		});
 	}
@@ -312,16 +316,22 @@ struct ExampleRunner {
 		int tile_m = int(get<0>(mma.tile_mnk()));
 		int tile_n = int(get<1>(mma.tile_mnk()));
 		int num_n_tiles = int(ceil_div(n, tile_n));
+		int num_reducer_wgs_v = 8;
+		if (const char* env = std::getenv("CUTLASS_AR_NUM_REDUCER_WGS")) {
+			num_reducer_wgs_v = std::max(1, std::atoi(env));
+		}
+		int num_reducer_rows_v = int(ceil_div(num_reducer_wgs_v, num_n_tiles));
 		sycl::range<2> local = {size(mma), 1};
 		sycl::range<2> global = {
-		    local[0] * ceil_div(n, tile_n),
-		    local[1] * ceil_div(m, tile_m)};
+		    local[0] * num_n_tiles,
+		    local[1] * (int(ceil_div(m, tile_m)) + num_reducer_rows_v)};
 		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
 		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
 		run_fused(A_t, B_t, C_t, D_t, mma, local, global, num_n_tiles,
 		          ipc_data_ptrs, ipc_signal_ptrs,
 		          options.alpha, 1u, options.use_push_mode != 0,
-		          rank, world_size, m, n);
+		          rank, world_size, m, n, num_reducer_wgs_v,
+		          options.debug_log != 0);
 		q.wait();
 		MPI_Barrier(MPI_COMM_WORLD);
 
@@ -421,13 +431,33 @@ struct ExampleRunner {
 		auto mma = choose_tiled_mma_ar(A, B, C);
 		int tile_m = int(get<0>(mma.tile_mnk()));
 		int tile_n = int(get<1>(mma.tile_mnk()));
+		int num_m_tiles = int(ceil_div(m, tile_m));
 		int num_n_tiles = int(ceil_div(n, tile_n));
+
+		// Number of reducer WGs: configurable via CUTLASS_AR_NUM_REDUCER_WGS env var
+		int num_reducer_wgs = 8;  // default
+		if (const char* env = std::getenv("CUTLASS_AR_NUM_REDUCER_WGS")) {
+			num_reducer_wgs = std::max(1, std::atoi(env));
+		}
+		// Reducer WGs are appended as extra rows in dim 1.
+		// Each row has num_n_tiles WGs in dim 0, so we need enough rows.
+		int num_reducer_rows = int(ceil_div(num_reducer_wgs, num_n_tiles));
+		// Actual number of reducer WGs launched (may be slightly more than requested)
+		int actual_reducer_wgs_launched = num_reducer_rows * num_n_tiles;
+
 		sycl::range<2> local = {size(mma), 1};
 		sycl::range<2> global = {
-		    local[0] * ceil_div(n, tile_n),
-		    local[1] * ceil_div(m, tile_m)};
+		    local[0] * num_n_tiles,
+		    local[1] * (num_m_tiles + num_reducer_rows)};
 		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
 		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
+
+		if (rank == 0) {
+			printf("[rank %d] Grid: %d GEMM WGs + %d reducer WGs (%d requested), "
+			       "subgroups_per_reducer_wg=%d\n",
+			       rank, num_m_tiles * num_n_tiles, actual_reducer_wgs_launched,
+			       num_reducer_wgs, int(size(mma)) / 16);
+		}
 
 		MPI_Barrier(MPI_COMM_WORLD);
 		std::cout << "[rank " << rank << "] initialization complete" << std::endl;
@@ -448,12 +478,15 @@ struct ExampleRunner {
 			if (signal_token == 0) signal_token = 1u;
 			return token;
 		};
+		bool enable_debug_log = (options.debug_log != 0);
 		std::cout << "[rank " << rank << "] warmup start (" << kWarmupIters << " iters)" << std::endl;
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
+			// Only log on the first warmup iteration to avoid flooding
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
 			          ipc_data_ptrs, ipc_signal_ptrs,
 			          options.alpha, next_signal_token(), options.use_push_mode != 0,
-			          rank, world_size, m, n);
+			          rank, world_size, m, n, num_reducer_wgs,
+			          enable_debug_log && (iter == 0));
 		}
 		q_->wait();
 		MPI_Barrier(MPI_COMM_WORLD);
@@ -465,7 +498,7 @@ struct ExampleRunner {
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
 			          ipc_data_ptrs, ipc_signal_ptrs,
 			          options.alpha, next_signal_token(), options.use_push_mode != 0,
-			          rank, world_size, m, n);
+			          rank, world_size, m, n, num_reducer_wgs);
 		}
 		auto ev_after = q_->ext_oneapi_submit_barrier();
 		q_->wait();

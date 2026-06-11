@@ -311,26 +311,176 @@ void gemm_and_push(
   // ---- Write to local data_slots[my_rank] via copy_c ----
   copy(copy_c, tCrC, tCgC);
 
-  // Pull-only path: no remote push writes from GEMM workgroups.
-
-  // Memory fence before setting flags
+  // Release fence: ensures data write is globally visible before flag write.
+  // This is the critical ordering guarantee — remote rank must not see flag
+  // before data is committed.
   sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
 
-  // Set flags to signal tile completion (only sub-group leader / work-item 0)
+  // Push flags to ALL remote ranks' local flag buffers and own local flags.
+  // This way consumers only poll their own local memory (fast local reads).
   if (local_id == 0) {
-    int flag_idx = params.my_rank * params.num_m_tiles * params.num_n_tiles
-                 + wg_m * params.num_n_tiles + wg_n;
-    // Pull mode: set flag on local flag buffer only
+    int tile_linear_id = wg_m * params.num_n_tiles + wg_n;
+    int flag_idx = params.my_rank * params.num_m_tiles * params.num_n_tiles + tile_linear_id;
+
+    // Write to own local flags (for local reducer to see)
     params.local_flags[flag_idx] = params.signal_token;
-    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+
+    // Push flag to each remote rank's flag buffer
+    for (int peer = 0; peer < params.world_size; ++peer) {
+      if (peer == params.my_rank) continue;
+      params.remote_flags_dev[peer][flag_idx] = params.signal_token;
+    }
   }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Reducer WG: polls flags, reduces data_slots, writes to D
+// Reducer WG: subgroup-level division — each subgroup handles a subset of tiles
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline uint32_t allreduce_load_acquire_u32(uint32_t* addr);
+
+inline void reducer_work_subgroup(
+    sycl::nd_item<2> item,
+    int reducer_wg_id,
+    int num_active_reducer_wgs,
+    GemmAllreduceParams const& params,
+    bool debug_log = false) {
+
+  int total_output_tiles = params.num_m_tiles * params.num_n_tiles;
+  int local_id = int(item.get_local_id(0));
+  int wg_size = int(item.get_local_range(0));
+
+  // Early exit for excess reducer WGs beyond the active limit
+  if (reducer_wg_id >= num_active_reducer_wgs) {
+    return;
+  }
+
+  // Subgroup-level division:
+  // Each WG has multiple subgroups (wg_size / 16).
+  // Each subgroup independently handles a subset of tiles.
+  constexpr int SG_SIZE = 16;
+  int num_sgs_per_wg = wg_size / SG_SIZE;
+  int local_sg_id = local_id / SG_SIZE;
+  int lane_id = local_id % SG_SIZE;
+
+  // Global subgroup ID across all reducer WGs
+  int total_reducer_sgs = num_active_reducer_wgs * num_sgs_per_wg;
+  int global_sg_id = reducer_wg_id * num_sgs_per_wg + local_sg_id;
+
+  constexpr int NUM_PER_TH = 4;  // 4 × int64_t = 32 bytes = 16 bf16
+  constexpr int BF16_PER_VEC = NUM_PER_TH * 4;  // 16 bf16 per vector load
+
+  using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
+  using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
+
+  int tile_m_size = 256;
+  int tile_n_size = 256;
+
+  // Each subgroup processes tiles where tile_idx % total_reducer_sgs == global_sg_id
+  for (int tile_idx = global_sg_id; tile_idx < total_output_tiles;
+       tile_idx += total_reducer_sgs) {
+    int tile_m = tile_idx / params.num_n_tiles;
+    int tile_n = tile_idx % params.num_n_tiles;
+
+    int tile_m_base = tile_m * tile_m_size;
+    int tile_n_base = tile_n * tile_n_size;
+    if (tile_m_base >= params.M || tile_n_base >= params.N) {
+      continue;
+    }
+
+    int tile_rows = std::min(tile_m_size, params.M - tile_m_base);
+    int tile_cols = std::min(tile_n_size, params.N - tile_n_base);
+    int64_t tile_elems = static_cast<int64_t>(tile_rows) * tile_cols;
+
+    // Step 1: Spin check flags — wait for all ranks to complete this tile.
+    // Only lane 0 in the subgroup does the polling (flags are pushed to local).
+    if (lane_id == 0) {
+      for (int src = 0; src < params.world_size; ++src) {
+        int flag_idx = src * params.num_m_tiles * params.num_n_tiles
+                     + tile_m * params.num_n_tiles + tile_n;
+        // Flags were pushed to our local buffer by remote producers
+        uint32_t* flag_ptr = &params.local_flags[flag_idx];
+        while (allreduce_load_acquire_u32(flag_ptr) != params.signal_token) {
+          // spin-wait
+        }
+      }
+    }
+
+    // Subgroup barrier: ensure all lanes see the flag-ready state
+    // (implicit via subgroup execution model on Intel — all lanes in a
+    // subgroup execute in lockstep, so lane 0's spin exit gates all lanes)
+
+    // Step 2: Acquire fence after flags confirmed — ensures subsequent data
+    // reads see the data that was written before the flag.
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+
+    // Step 3: Each lane in the subgroup cooperatively reduces a portion of the tile.
+    // Lane i handles elements where elem_idx % SG_SIZE == lane_id.
+    int64_t vec_elems = tile_elems / BF16_PER_VEC;
+    int64_t rank_slot_vec_stride = (static_cast<int64_t>(params.M) * params.N) / BF16_PER_VEC;
+    int64_t rank_slot_elem_stride = static_cast<int64_t>(params.M) * params.N;
+
+    auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
+    auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
+
+    // Each lane handles vec elements: lane_id, lane_id + SG_SIZE, ...
+    for (int64_t vi = lane_id; vi < vec_elems; vi += SG_SIZE) {
+      int64_t bf16_idx = vi * BF16_PER_VEC;
+      int row = static_cast<int>(bf16_idx / tile_cols);
+      int col = static_cast<int>(bf16_idx % tile_cols);
+      int64_t global_offset =
+          (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
+      int64_t global_vec_offset = global_offset / BF16_PER_VEC;
+
+      // Start with own rank's data
+      int src0 = params.my_rank;
+      auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src0]);
+      BF16Vec sum = buf0[static_cast<int64_t>(src0) * rank_slot_vec_stride + global_vec_offset]
+                        .template as<BF16Vec>();
+
+      // Accumulate from all other ranks (rank rotation for balanced access)
+      #pragma unroll 8
+      for (int step = 1; step < params.world_size; ++step) {
+        int src = (params.my_rank + step) % params.world_size;
+        auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
+        sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride + global_vec_offset]
+                   .template as<BF16Vec>();
+      }
+
+      out_vec[global_vec_offset] = sum.template as<LoadVec>();
+    }
+
+    // Scalar tail: only lane 0 handles remainder
+    if (lane_id == 0) {
+      int64_t scalar_begin = vec_elems * BF16_PER_VEC;
+      for (int64_t i = scalar_begin; i < tile_elems; ++i) {
+        int row = static_cast<int>(i / tile_cols);
+        int col = static_cast<int>(i % tile_cols);
+        int64_t global_offset =
+            (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
+
+        float acc = 0.0f;
+        for (int step = 0; step < params.world_size; ++step) {
+          int src = (params.my_rank + step) % params.world_size;
+          auto* buf = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src]);
+          acc += static_cast<float>(
+              buf[static_cast<int64_t>(src) * rank_slot_elem_stride + global_offset]);
+        }
+        out_scalar[global_offset] = static_cast<SyclBF16>(acc);
+      }
+    }
+
+    // Debug log: tile reduction complete
+    if (debug_log && lane_id == 0) {
+      printf("[AR-REDUCE-TILE] rank=%d, sg=%d, tile(%d,%d) reduced, elems=%lld\n",
+             params.my_rank, global_sg_id, tile_m, tile_n, (long long)tile_elems);
+    }
+  }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// Legacy reducer_work (kept for reference / fallback)
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline void reducer_work(
     sycl::nd_item<2> item,
@@ -465,13 +615,37 @@ void gemm_allreduce_device(
     int world_size,
     int m,
     int n,
-    int num_n_tiles) {
+    int num_n_tiles,
+    int num_reducer_wgs,
+    bool debug_log = false) {
 
   (void)use_push_mode;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
-  int reducer_id = int(item.get_group(1)) * num_n_tiles + int(item.get_group(0));
 
+  int num_m_tiles = ceil_div(m, int(get<0>(mma.tile_mnk())));
+  int num_gemm_wgs = num_m_tiles * num_n_tiles;
+
+  // Linearize WG index: first num_gemm_wgs are GEMM, rest are reducers.
+  // Grid layout: dim0 = num_n_tiles groups, dim1 = (num_m_tiles + num_reducer_rows) groups
+  // GEMM WGs: group(1) < num_m_tiles
+  // Reducer WGs: group(1) >= num_m_tiles
+  int wg_m = int(item.get_group(1));
+  int wg_n = int(item.get_group(0));
+  int num_groups_dim0 = int(item.get_group_range(0));
+  int linear_wg_id = wg_m * num_groups_dim0 + wg_n;
+  int local_id = int(item.get_local_id(0));
+
+  // Debug: print kernel launch info (only once from WG 0, thread 0)
+  if (debug_log && linear_wg_id == 0 && local_id == 0) {
+    printf("[AR-KERNEL] rank=%d, M=%d, N=%d, K=%d, num_m_tiles=%d, num_n_tiles=%d, "
+           "num_gemm_wgs=%d, num_reducer_wgs=%d, signal_token=%u, wg_size=%d\n",
+           rank, m, n, int(shape<1>(A)), num_m_tiles, num_n_tiles,
+           num_gemm_wgs, num_reducer_wgs, signal_token,
+           int(item.get_local_range(0)));
+  }
+
+  // Build params
   GemmAllreduceParams params{};
   params.A = static_cast<void const*>(A.data().get());
   params.B = static_cast<void const*>(B.data().get());
@@ -483,23 +657,43 @@ void gemm_allreduce_device(
   params.alpha = alpha;
   params.world_size = world_size;
   params.my_rank = rank;
-  params.num_m_tiles = ceil_div(m, int(get<0>(mma.tile_mnk())));
+  params.num_m_tiles = num_m_tiles;
   params.num_n_tiles = num_n_tiles;
-  params.num_reducer_wgs = params.num_m_tiles * params.num_n_tiles;
+  params.num_reducer_wgs = num_reducer_wgs;
   params.local_data_slots = reinterpret_cast<SyclBF16*>(ipc_data_ptrs[rank]);
   params.remote_data_slots_dev = reinterpret_cast<SyclBF16**>(ipc_data_ptrs);
   params.local_flags = reinterpret_cast<uint32_t*>(ipc_signal_ptrs[rank]);
   params.remote_flags_dev = reinterpret_cast<uint32_t**>(ipc_signal_ptrs);
   params.D = reinterpret_cast<SyclBF16*>(D.data().get());
   params.ldd = stride<0>(D);
-  // Keep pull-only behavior in gemm_allreduce_device path.
-  params.use_push_mode = false;
+  params.use_push_mode = true;  // Push flags to remote
   params.signal_token = signal_token;
-  params.max_active_reducer_wgs = 8;  // Configurable limit on active reducer WGs
+  params.max_active_reducer_wgs = num_reducer_wgs;
 
-  // gemm_and_push(A, B, C, mma, alpha, params);
-  // sycl::group_barrier(item.get_group());
-  reducer_work(item, reducer_id, params);
+  if (linear_wg_id < num_gemm_wgs) {
+    // ---- GEMM workgroup: compute tile, write data, push flags ----
+    if (debug_log && local_id == 0) {
+      printf("[AR-GEMM] rank=%d, wg=(%d,%d), linear=%d, tile_m=%d, tile_n=%d\n",
+             rank, wg_m, wg_n, linear_wg_id, wg_m, wg_n);
+    }
+    gemm_and_push(A, B, C, mma, alpha, params);
+    if (debug_log && local_id == 0) {
+      printf("[AR-GEMM-DONE] rank=%d, wg=(%d,%d), pushed flags for tile(%d,%d)\n",
+             rank, wg_m, wg_n, wg_m, wg_n);
+    }
+  } else {
+    // ---- Reducer workgroup: subgroup-level tile reduction ----
+    int reducer_wg_id = linear_wg_id - num_gemm_wgs;
+    if (debug_log && local_id == 0) {
+      printf("[AR-REDUCER] rank=%d, reducer_wg_id=%d/%d, linear=%d\n",
+             rank, reducer_wg_id, num_reducer_wgs, linear_wg_id);
+    }
+    reducer_work_subgroup(item, reducer_wg_id, num_reducer_wgs, params, debug_log);
+    if (debug_log && local_id == 0) {
+      printf("[AR-REDUCER-DONE] rank=%d, reducer_wg_id=%d\n",
+             rank, reducer_wg_id);
+    }
+  }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
