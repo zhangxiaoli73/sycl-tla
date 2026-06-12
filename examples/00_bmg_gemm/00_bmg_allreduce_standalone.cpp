@@ -2,429 +2,541 @@
  * Copyright (C) 2025 - 2026 Intel Corporation, All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
+/*
+ * Standalone BMG One-Shot Allreduce benchmark.
+ *
+ * Implementation mirrors bench_oneshot_vs_ccl.cpp for consistent performance:
+ *   - Direct exchange_ipc_ptrs (no SymmMemory wrapper overhead)
+ *   - zeContextMakeMemoryResident for peer buffers
+ *   - q.wait() per iteration (no MPI_Barrier in timed loop)
+ *   - Same fused per-WG signal barrier as bench_oneshot_vs_ccl
+ *
+ * Build (via CMake) or manually:
+ *   icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg" -O2 \
+ *        -DCUTLASS_ENABLE_SYCL -DSYCL_INTEL_TARGET \
+ *        -I../examples/00_bmg_gemm -I../include -I../tools/util/include \
+ *        -I$I_MPI_ROOT/include -L$I_MPI_ROOT/lib -lmpi -lze_loader \
+ *        00_bmg_allreduce_standalone.cpp -o 00_bmg_allreduce_standalone
+ *
+ * Run:
+ *   ZE_AFFINITY_MASK=4,5,6,7 mpirun -np 4 ./00_bmg_allreduce_standalone --m=256 --n=2048
+ */
 
 #include <mpi.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-#include <cute/tensor.hpp>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <level_zero/ze_api.h>
 
-#include "cutlass/util/command_line.h"
-#include "gemm_allreduce_kernel.hpp"
+#include "Signal.hpp"
 #include "symm.hpp"
 
-using Element = bfloat16_t;
+using bf16 = sycl::ext::oneapi::bfloat16;
 
+// ---------- Constants matching bench_oneshot_vs_ccl.cpp ----------
+constexpr int kOneShotMaxNumGroups_AR = 24;
+constexpr int kOneShotMaxNumThreads_AR = 256;
+constexpr int kFusedSignalBaseU32_AR = 2456;
+constexpr int kSignalPadU32Slots_AR = 8192;  // enough for 4 regions × 24 groups × 16 ws
+constexpr int kVecBytes = 16;
+constexpr int kVecBf16 = kVecBytes / (int)sizeof(bf16);  // 8
+
+template <int N>
+struct alignas(kVecBytes) VecBf16 {
+  bf16 data[N];
+};
+
+// ---------- Fused allreduce kernel (matches bench_oneshot_vs_ccl FusedOneShotKernel) ----------
+template <int kWorldSize>
+struct FusedOneShotKernel_AR {
+  bf16** peer_ptrs;
+  bf16* output_ptr;
+  uint32_t** signal_pads;
+  int64_t numel;
+  int my_rank;
+
+  static inline uint32_t* slot_of(
+      uint32_t** pads, int owner, int region, int group_id, int src_rank) {
+    const int64_t region_off =
+        (int64_t)region * kOneShotMaxNumGroups_AR * kWorldSize;
+    return pads[owner] + kFusedSignalBaseU32_AR + region_off +
+        (int64_t)group_id * kWorldSize + src_rank;
+  }
+
+  inline void wg_barrier(sycl::nd_item<1> it, int region) const {
+    const auto lid = it.get_local_id(0);
+    const auto gid = it.get_group(0);
+    if (lid < (size_t)kWorldSize) {
+      int peer = (int)lid;
+      if (peer != my_rank) {
+        uint32_t* put = slot_of(signal_pads, peer, region, gid, my_rank);
+        uint32_t* wait = slot_of(signal_pads, my_rank, region, gid, peer);
+        put_signal<std::memory_order_release>(put);
+        wait_signal<std::memory_order_acquire>(wait);
+      }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+  }
+
+  void operator()(sycl::nd_item<1> it) const {
+    wg_barrier(it, /*region=*/0);
+
+    const int64_t tid = (int64_t)it.get_global_linear_id();
+    const int64_t stride = (int64_t)it.get_global_range(0);
+    const int64_t vec_total = numel / kVecBf16;
+    using V = VecBf16<kVecBf16>;
+
+    for (int64_t v = tid; v < vec_total; v += stride) {
+      const int64_t e = v * kVecBf16;
+      V acc = *reinterpret_cast<const V*>(peer_ptrs[my_rank] + e);
+#pragma unroll
+      for (int step = 1; step < kWorldSize; ++step) {
+        const int p = (my_rank + step) % kWorldSize;
+        V rhs = *reinterpret_cast<const V*>(peer_ptrs[p] + e);
+#pragma unroll
+        for (int i = 0; i < kVecBf16; ++i) {
+          acc.data[i] = (bf16)((float)acc.data[i] + (float)rhs.data[i]);
+        }
+      }
+      *reinterpret_cast<V*>(output_ptr + e) = acc;
+    }
+
+    it.barrier(sycl::access::fence_space::local_space);
+    wg_barrier(it, /*region=*/1);
+  }
+};
+
+// ---------- Optimized: Reduce-Scatter + Allgather kernel ----------
+// Phase 1: Each rank reduces only its 1/world_size chunk (less PCIe traffic)
+// Phase 2: Each rank reads the other chunks from the ranks that computed them
+// Total cross-device reads: 2 * (world_size-1)/world_size * numel
+//   vs all-to-all: (world_size-1) * numel
+// For ws=4: 1.5MB vs 3MB cross-device reads
+constexpr int kRSAG_MaxGroups = 24;
+
+template <int kWorldSize>
+struct ReduceScatterAllgatherKernel {
+  bf16** peer_ptrs;      // input data on each rank (read-only in both phases)
+  bf16** peer_out_ptrs;  // IPC-visible output buffer per rank (write Phase1, read Phase2)
+  bf16* output_ptr;      // local final output
+  uint32_t** signal_pads;
+  int64_t numel;
+  int my_rank;
+
+  static inline uint32_t* slot_of(
+      uint32_t** pads, int owner, int region, int group_id, int src_rank) {
+    const int64_t region_off =
+        (int64_t)region * kRSAG_MaxGroups * kWorldSize;
+    return pads[owner] + kFusedSignalBaseU32_AR + region_off +
+        (int64_t)group_id * kWorldSize + src_rank;
+  }
+
+  inline void wg_barrier(sycl::nd_item<1> it, int region) const {
+    const auto lid = it.get_local_id(0);
+    const auto gid = it.get_group(0);
+    if (lid < (size_t)kWorldSize) {
+      int peer = (int)lid;
+      if (peer != my_rank) {
+        uint32_t* put = slot_of(signal_pads, peer, region, gid, my_rank);
+        uint32_t* wait = slot_of(signal_pads, my_rank, region, gid, peer);
+        put_signal<std::memory_order_release>(put);
+        wait_signal<std::memory_order_acquire>(wait);
+      }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+  }
+
+  // Point-to-point signal: notify one specific peer that we're done
+  inline void signal_peer(sycl::nd_item<1> it, int peer, int region) const {
+    const auto lid = it.get_local_id(0);
+    const auto gid = it.get_group(0);
+    if (lid == 0) {
+      uint32_t* put = slot_of(signal_pads, peer, region, gid, my_rank);
+      put_signal<std::memory_order_release>(put);
+    }
+  }
+
+  // Point-to-point wait: wait for one specific peer
+  inline void wait_for_peer(sycl::nd_item<1> it, int peer, int region) const {
+    const auto lid = it.get_local_id(0);
+    const auto gid = it.get_group(0);
+    if (lid == 0) {
+      uint32_t* wait = slot_of(signal_pads, my_rank, region, gid, peer);
+      wait_signal<std::memory_order_acquire>(wait);
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+  }
+
+  void operator()(sycl::nd_item<1> it) const {
+    // No pre-barrier needed: input data is static across iterations,
+    // q.wait() between iterations ensures prior kernel completion.
+
+    const int64_t tid = (int64_t)it.get_global_linear_id();
+    const int64_t stride = (int64_t)it.get_global_range(0);
+    using V = VecBf16<kVecBf16>;
+
+    // Phase 1: Reduce-scatter
+    const int64_t chunk_elems = numel / kWorldSize;
+    const int64_t chunk_vecs = chunk_elems / kVecBf16;
+    const int64_t my_chunk_start = (int64_t)my_rank * chunk_elems;
+
+    for (int64_t v = tid; v < chunk_vecs; v += stride) {
+      const int64_t e = my_chunk_start + v * kVecBf16;
+      V acc = *reinterpret_cast<const V*>(peer_ptrs[my_rank] + e);
+#pragma unroll
+      for (int step = 1; step < kWorldSize; ++step) {
+        const int p = (my_rank + step) % kWorldSize;
+        V rhs = *reinterpret_cast<const V*>(peer_ptrs[p] + e);
+#pragma unroll
+        for (int i = 0; i < kVecBf16; ++i) {
+          acc.data[i] = (bf16)((float)acc.data[i] + (float)rhs.data[i]);
+        }
+      }
+      // Write reduced chunk to IPC output (serves as both peer-visible AND final output)
+      *reinterpret_cast<V*>(output_ptr + e) = acc;
+    }
+
+    // Mid-barrier: wait for all peers to finish reduce-scatter
+    it.barrier(sycl::access::fence_space::local_space);
+    wg_barrier(it, /*region=*/1);
+
+    // Phase 2: Allgather - copy other peers' chunks into our output
+    const int64_t total_ag_vecs = chunk_vecs * (kWorldSize - 1);
+    for (int64_t flat = tid; flat < total_ag_vecs; flat += stride) {
+      const int step = (int)(flat / chunk_vecs) + 1;
+      const int64_t v = flat % chunk_vecs;
+      const int src = (my_rank + step) % kWorldSize;
+      const int64_t e = (int64_t)src * chunk_elems + v * kVecBf16;
+      V val = *reinterpret_cast<const V*>(peer_out_ptrs[src] + e);
+      *reinterpret_cast<V*>(output_ptr + e) = val;
+    }
+  }
+};
+
+// ---------- Launch config (matches bench_oneshot_vs_ccl init_launch_cfg) ----------
+static void get_launch_cfg(int64_t numel, int64_t& groups, int64_t& threads) {
+  int64_t total_vec = numel / kVecBf16;
+  if (total_vec <= kOneShotMaxNumThreads_AR) {
+    groups = 1;
+    threads = std::max<int64_t>(32, (total_vec + 31) / 32 * 32);
+  } else {
+    groups = std::min<int64_t>(
+        (total_vec + kOneShotMaxNumThreads_AR - 1) / kOneShotMaxNumThreads_AR,
+        (int64_t)kOneShotMaxNumGroups_AR);
+    threads = kOneShotMaxNumThreads_AR;
+  }
+}
+
+static void get_rsag_launch_cfg(int64_t numel, int world_size, int64_t& groups, int64_t& threads) {
+  int64_t chunk_vecs = (numel / world_size) / kVecBf16;
+  threads = kOneShotMaxNumThreads_AR;
+  groups = std::min<int64_t>(
+      (chunk_vecs + threads - 1) / threads,
+      (int64_t)kRSAG_MaxGroups);
+  groups = std::max<int64_t>(groups, 1);
+}
+
+// ---------- Options ----------
 struct Options {
   bool help = false;
   int m = 8192;
   int n = 4096;
-  int iterations = 20;
+  int iterations = 100;
+  int warmup = 20;
   int verify = 1;
-  int wg_size = 0;      // 0 = auto
-  int max_blocks = 0;   // 0 = auto
 
   void parse(int argc, char** argv) {
-    std::vector<char const*> cargs(argc);
-    for (int i = 0; i < argc; ++i) {
-      cargs[i] = argv[i];
-    }
-
-    cutlass::CommandLine cmd(argc, cargs.data());
-    if (cmd.check_cmd_line_flag("help")) {
-      help = true;
-      return;
-    }
-
-    cmd.get_cmd_line_argument("m", m, 8192);
-    cmd.get_cmd_line_argument("n", n, 4096);
-    cmd.get_cmd_line_argument("iterations", iterations, 20);
-    cmd.get_cmd_line_argument("verify", verify, 1);
-    cmd.get_cmd_line_argument("wg_size", wg_size, 0);
-    cmd.get_cmd_line_argument("max_blocks", max_blocks, 0);
-  }
-
-  std::ostream& print_usage(std::ostream& out) const {
-    out << "Standalone BMG One-Shot Allreduce Example\\n\\n"
-        << "  --m=<int>            rows (default 8192)\\n"
-        << "  --n=<int>            cols (default 4096)\\n"
-        << "  --iterations=<int>   benchmark iterations (default 20)\\n"
-        << "  --verify=<int>       0/1 verify output (default 1)\\n"
-        << "  --wg_size=<int>      work-group size, 0=auto (default 0)\\n"
-        << "  --max_blocks=<int>   launch blocks cap, 0=auto (default 0)\\n\\n"
-        << "Constraints:\\n"
-        << "  - This one-shot path is vector-only. m * n must be divisible by alignment/sizeof(bf16).\\n"
-        << "    With current build-time alignment=32 bytes, m * n must be divisible by 16.\\n\\n";
-    return out;
-  }
-};
-
-template <int NUM_PER_TH>
-class StandaloneOneShotAllreduceKernelName;
-
-struct Runner {
-  std::unique_ptr<sycl::queue> q_;
-  std::unique_ptr<SymmMemory> symm_;
-
-  template <int NUM_PER_TH>
-    void launch_one_shot_allreduce(
-      Element** ipc_data_ptrs,
-      uint32_t** ipc_signal_ptrs,
-      Element* local_slot, //local symm data
-      Element const* local_input,
-      Element* out,
-      int* dev_error,
-      int rank,
-      int world_size,
-      int64_t n_elems,
-      uint32_t signal_token,
-      int cfg_wg_size,
-      int cfg_max_blocks) {
-
-    constexpr int BF16_PER_I64 = 4;
-    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;  // bf16 elements per thread vector op
-
-    if ((n_elems % BF16_VEC) != 0) {
-      throw std::runtime_error(
-        "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
-    }
-
-    // Thread sizing (inspired by CUDA one-shot: target ~512 threads to limit register pressure)
-    int dev_max_wg = static_cast<int>(
-        q_->get_device().get_info<sycl::info::device::max_work_group_size>());
-    int auto_wg_size = std::min(dev_max_wg, 256);
-    int wg_size = (cfg_wg_size > 0) ? std::min(dev_max_wg, cfg_wg_size) : auto_wg_size;
-    if (wg_size <= 0) {
-      throw std::runtime_error("Invalid wg_size after device clamp.");
-    }
-
-    int64_t vec_elems = n_elems / BF16_VEC;
-    int64_t blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    int auto_max_blocks = std::max(1, static_cast<int>(
-      q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
-    int max_blocks = (cfg_max_blocks > 0) ? cfg_max_blocks : auto_max_blocks;
-    blocks = std::min<int64_t>(blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
-    int64_t global_size = blocks * wg_size;
-    std::cout << "Launching one-shot allreduce with global_size=" << global_size
-              << " wg_size=" << wg_size
-              << " blocks=" << blocks
-              << std::endl;
-    
-    auto do_submit = [&](auto ws_const) {
-      constexpr int kWS = decltype(ws_const)::value;
-      q_->submit([&](sycl::handler& h) {
-        h.parallel_for(
-            sycl::nd_range<1>(
-                sycl::range<1>(static_cast<size_t>(global_size)),
-                sycl::range<1>(static_cast<size_t>(wg_size))),
-            FusedOneShotAllReduceSumKernel<Element, kWS>{
-                ipc_data_ptrs,
-                out,
-                ipc_signal_ptrs,
-                /*input_offset=*/0,
-                n_elems,
-                rank});
-      });
-    };
-
-    switch (world_size) {
-      case 1:  do_submit(std::integral_constant<int,  1>{}); break;
-      case 2:  do_submit(std::integral_constant<int,  2>{}); break;
-      case 3:  do_submit(std::integral_constant<int,  3>{}); break;
-      case 4:  do_submit(std::integral_constant<int,  4>{}); break;
-      case 5:  do_submit(std::integral_constant<int,  5>{}); break;
-      case 6:  do_submit(std::integral_constant<int,  6>{}); break;
-      case 7:  do_submit(std::integral_constant<int,  7>{}); break;
-      case 8:  do_submit(std::integral_constant<int,  8>{}); break;
-      case 9:  do_submit(std::integral_constant<int,  9>{}); break;
-      case 10: do_submit(std::integral_constant<int, 10>{}); break;
-      case 11: do_submit(std::integral_constant<int, 11>{}); break;
-      case 12: do_submit(std::integral_constant<int, 12>{}); break;
-      case 13: do_submit(std::integral_constant<int, 13>{}); break;
-      case 14: do_submit(std::integral_constant<int, 14>{}); break;
-      case 15: do_submit(std::integral_constant<int, 15>{}); break;
-      case 16: do_submit(std::integral_constant<int, 16>{}); break;
-      default:
-        throw std::runtime_error(
-            "FusedOneShotAllReduceSumKernel: world_size must be in [1, 16].");
-    }
-  }
-
-  bool run(Options const& options, sycl::device const& device, int rank, int world_size) {
-    int m = options.m;
-    int n = options.n;
-    int64_t n_elems = static_cast<int64_t>(m) * n;
-
-    if (!q_) {
-      auto ctx = sycl::context(device);
-      q_ = std::make_unique<sycl::queue>(
-          ctx, device,
-          sycl::property_list{sycl::property::queue::in_order{},
-                              sycl::property::queue::enable_profiling{}});
-    }
-
-    size_t per_rank_elems = static_cast<size_t>(m) * n;
-    size_t total_data_elems = per_rank_elems * world_size;
-
-    // one_shot_signal_sync indexes signal pad as [block_id * world_size + rank],
-    // so signal pad storage must cover all launched blocks.
-    constexpr int ALIGNMENT_BYTES = 32;
-    constexpr int BF16_PER_I64 = 4;
-    constexpr int ELEM_PER_THREAD = ALIGNMENT_BYTES / sizeof(Element);
-    static_assert((ELEM_PER_THREAD % 4) == 0,
-                  "ELEM_PER_THREAD must be divisible by 4 for VecI64 packing");
-    constexpr int NUM_PER_TH = ELEM_PER_THREAD / 4;
-    constexpr int BF16_VEC = NUM_PER_TH * BF16_PER_I64;
-
-    if ((n_elems % BF16_VEC) != 0) {
-      throw std::runtime_error(
-          "n_elems must be divisible by NUM_PER_TH * 4 for one-shot vector allreduce.");
-    }
-
-    int dev_max_wg = static_cast<int>(
-        q_->get_device().get_info<sycl::info::device::max_work_group_size>());
-    int auto_wg_size = std::min(dev_max_wg, 256);
-    int wg_size = (options.wg_size > 0) ? std::min(dev_max_wg, options.wg_size) : auto_wg_size;
-    if (wg_size <= 0) {
-      throw std::runtime_error("Invalid wg_size after device clamp.");
-    }
-    int auto_max_blocks = std::max(1, static_cast<int>(
-        q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8);
-    int max_blocks = (options.max_blocks > 0) ? options.max_blocks : auto_max_blocks;
-    int64_t vec_elems = n_elems / BF16_VEC;
-    int64_t required_blocks = std::max<int64_t>(1, (vec_elems + wg_size - 1) / wg_size);
-    int64_t launch_blocks = std::min<int64_t>(required_blocks, std::min<int64_t>(max_blocks, kOneShotMaxNumGroups));
-    size_t signal_pad_elems = static_cast<size_t>(kFusedSignalBaseU32) +
-                              2u * static_cast<size_t>(kOneShotMaxNumGroups) * static_cast<size_t>(world_size);
-    std::cout << "Symm data elements: " << total_data_elems << ", signal pad elemements: " << signal_pad_elems << std::endl;
-
-    if (!symm_) {
-      symm_ = std::make_unique<SymmMemory>(
-          m, n, 1, rank, world_size, *q_, 8,
-          total_data_elems, signal_pad_elems);
-    }
-
-    // one-shot handshake protocol assumes signal pads start from 0 on first launch.
-    // Re-initialize local signal pad for this run.
-    q_->memset(symm_->local_signal_ptr_, 0, signal_pad_elems * sizeof(uint32_t)).wait();
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    Element* local_data = reinterpret_cast<Element*>(symm_->local_data_ptr_);
-    Element* local_slot = local_data + static_cast<size_t>(rank) * per_rank_elems;
-    Element* local_input = sycl::malloc_device<Element>(static_cast<size_t>(n_elems), *q_);
-    Element* out = sycl::malloc_device<Element>(static_cast<size_t>(n_elems), *q_);
-    int* dev_error = sycl::malloc_device<int>(1, *q_);
-
-    if (local_input == nullptr || out == nullptr || dev_error == nullptr) {
-      throw std::runtime_error("Failed to allocate local_input/output/dev_error buffer.");
-    }
-
-    // Keep slots clean for debug visibility; one-shot kernel publishes local_input to local_slot.
-    q_->memset(local_data, 0, total_data_elems * sizeof(Element)).wait();
-    q_->submit([&](sycl::handler& h) {
-      h.parallel_for(sycl::range<1>(static_cast<size_t>(n_elems)), [=](sycl::id<1> i) {
-        local_input[i] = static_cast<Element>(static_cast<float>(rank + 1));
-      });
-    });
-    q_->wait();
-    MPI_Barrier(MPI_COMM_WORLD);
-
-    // Build per-rank slot-adjusted device pointer array.
-    // remote_data_ptrs_[r] is the IPC-mapped base of peer r's local_data_ptr_.
-    // Rank r wrote its data at base + r * per_rank_elems, so we adjust each pointer
-    // so that slot_ptrs[r] points directly at the data that rank r produced.
-    std::vector<Element*> host_slot_ptrs(world_size);
-    for (int r = 0; r < world_size; ++r) {
-      uint8_t* base = reinterpret_cast<uint8_t*>(symm_->remote_data_ptrs_[r]);
-      host_slot_ptrs[r] = reinterpret_cast<Element*>(
-          base + static_cast<size_t>(r) * per_rank_elems * sizeof(Element));
-    }
-    Element** dev_slot_ptrs = sycl::malloc_device<Element*>(static_cast<size_t>(world_size), *q_);
-    if (dev_slot_ptrs == nullptr) {
-      throw std::runtime_error("Failed to allocate dev_slot_ptrs.");
-    }
-    q_->memcpy(dev_slot_ptrs, host_slot_ptrs.data(),
-               static_cast<size_t>(world_size) * sizeof(Element*)).wait();
-
-    static_assert(ALIGNMENT_BYTES % sizeof(Element) == 0,
-            "ALIGNMENT_BYTES must be divisible by element size");
-
-    if (rank == 0) {
-      std::cout << "[one-shot] alignment=" << ALIGNMENT_BYTES
-                << "B, elements-per-thread=" << ELEM_PER_THREAD
-                << ", NUM_PER_TH=" << NUM_PER_TH
-                << ", wg_size=" << (options.wg_size > 0 ? options.wg_size : std::min(static_cast<int>(q_->get_device().get_info<sycl::info::device::max_work_group_size>()), 256))
-                << ", max_blocks=" << (options.max_blocks > 0 ? options.max_blocks : std::max(1, static_cast<int>(q_->get_device().get_info<sycl::info::device::max_compute_units>()) * 8))
-                << std::endl;
-    }
-
-    uint32_t signal_token = 1;
-    std::cout << "[rank " << rank << "] Starting one-shot allreduce warmup..." << std::endl;
-    for (int i = 0; i < 5; ++i) {
-      q_->memset(dev_error, 0, sizeof(int)).wait();
-      launch_one_shot_allreduce<NUM_PER_TH>(
-          dev_slot_ptrs,
-          symm_->remote_signal_ptrs_dev_,
-          local_slot,
-          local_input,
-          out,
-          dev_error,
-          rank,
-          world_size,
-          n_elems,
-          signal_token,
-          options.wg_size,
-          options.max_blocks);
-      signal_token += 2;
-      q_->wait();
-      int host_error = 0;
-      q_->memcpy(&host_error, dev_error, sizeof(int)).wait();
-      if (host_error != 0) {
-        throw std::runtime_error("One-shot allreduce warmup failed (device sync timeout).");
-      }
-    }
-
-    std::cout << "[rank " << rank << "] Starting one-shot allreduce benchmark for "
-              << options.iterations << " iterations..." << std::endl;
-    q_->memset(dev_error, 0, sizeof(int)).wait();
-     MPI_Barrier(MPI_COMM_WORLD);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      launch_one_shot_allreduce<NUM_PER_TH>(
-          dev_slot_ptrs,
-          symm_->remote_signal_ptrs_dev_,
-          local_slot,
-          local_input,
-          out,
-          dev_error,
-          rank,
-          world_size,
-          n_elems,
-          signal_token,
-          options.wg_size,
-          options.max_blocks);
-      signal_token += 2;
-      MPI_Barrier(MPI_COMM_WORLD);
-    }
-    q_->wait();
-    auto t1 = std::chrono::high_resolution_clock::now();
-    std::cout << "[rank " << rank << "] One-shot allreduce benchmark completed." << std::endl;
-
-    int host_error = 0;
-    q_->memcpy(&host_error, dev_error, sizeof(int)).wait();
-    if (host_error != 0) {
-      throw std::runtime_error("One-shot allreduce failed (device sync timeout).");
-    }
-
-    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    double avg_ms = total_ms / std::max(1, options.iterations);
-
-    if (true) {
-      std::cout << "Allreduce one-shot standalone: m=" << m
-                << " n=" << n
-                << " world_size=" << world_size
-                << " avg_ms=" << avg_ms << std::endl;
-    }
-
-    bool passed = true;
-    if (options.verify != 0) {
-      // GPU result
-      std::vector<float> host_gpu(static_cast<size_t>(n_elems));
-      {
-        std::vector<Element> tmp(static_cast<size_t>(n_elems));
-        q_->memcpy(tmp.data(), out, static_cast<size_t>(n_elems) * sizeof(Element)).wait();
-        for (size_t i = 0; i < tmp.size(); ++i) {
-          host_gpu[i] = static_cast<float>(tmp[i]);
+    for (int i = 1; i < argc; ++i) {
+      std::string a = argv[i];
+      // Support both "--m=256" and "--m 256" formats
+      auto get_val = [&](const std::string& key) -> int {
+        if (a.rfind(key + "=", 0) == 0) {
+          return std::atoi(a.c_str() + key.size() + 1);
+        } else if (a == key && i + 1 < argc) {
+          return std::atoi(argv[++i]);
         }
-      }
-
-      // Reference: MPI_Allreduce of each rank's local data
-      std::vector<float> host_local(static_cast<size_t>(n_elems),
-                                    static_cast<float>(rank + 1));
-      std::vector<float> host_ref(static_cast<size_t>(n_elems));
-      MPI_Allreduce(host_local.data(), host_ref.data(),
-                   static_cast<int>(n_elems), MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-
-      size_t mismatch = 0;
-      double max_abs = 0.0;
-      double max_rel = 0.0;
-      for (size_t i = 0; i < host_ref.size(); ++i) {
-        double ref = static_cast<double>(host_ref[i]);
-        double got = static_cast<double>(host_gpu[i]);
-        double diff = std::abs(ref - got);
-        double rel = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
-        max_abs = std::max(max_abs, diff);
-        max_rel = std::max(max_rel, rel);
-        if (rel > 1e-2) ++mismatch;
-      }
-
-      passed = (mismatch == 0);
-      std::cout << "[rank " << rank << "] verify "
-                << (passed ? "PASSED" : "FAILED")
-                << " ref[0]=" << host_ref[0]
-                << " gpu[0]=" << host_gpu[0]
-                << " max_abs=" << max_abs
-                << " max_rel=" << max_rel
-                << " mismatch=" << mismatch << "/" << host_ref.size()
-                << std::endl;
+        return INT_MIN;
+      };
+      if (a == "--help" || a == "-h") { help = true; return; }
+      int v;
+      if ((v = get_val("--m")) != INT_MIN) m = v;
+      else if ((v = get_val("--n")) != INT_MIN) n = v;
+      else if ((v = get_val("--iterations")) != INT_MIN) iterations = v;
+      else if ((v = get_val("--warmup")) != INT_MIN) warmup = v;
+      else if ((v = get_val("--verify")) != INT_MIN) verify = v;
     }
+  }
 
-    sycl::free(dev_slot_ptrs, *q_);
-    sycl::free(local_input, *q_);
-    sycl::free(out, *q_);
-    sycl::free(dev_error, *q_);
-    return passed;
+  void print_usage() const {
+    std::printf(
+        "Standalone BMG One-Shot Allreduce (bench-style)\n\n"
+        "  --m=<int>            rows (default 8192)\n"
+        "  --n=<int>            cols (default 4096)\n"
+        "  --iterations=<int>   benchmark iterations (default 100)\n"
+        "  --warmup=<int>       warmup iterations (default 20)\n"
+        "  --verify=<int>       0/1 verify output (default 1)\n\n");
   }
 };
 
+// ---------- main ----------
 int main(int argc, char** argv) {
   MPI_Init(&argc, &argv);
 
-  int rank = 0;
-  int world_size = 1;
+  int rank = 0, world_size = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
   Options options;
   options.parse(argc, argv);
-
   if (options.help) {
-    if (rank == 0) {
-      options.print_usage(std::cout) << std::endl;
-    }
+    if (rank == 0) options.print_usage();
     MPI_Finalize();
     return 0;
   }
 
-  auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
-  if (devices.empty()) {
-    if (rank == 0) {
-      std::cerr << "No GPU devices found" << std::endl;
-    }
+  int m = options.m;
+  int n = options.n;
+  int64_t numel = (int64_t)m * n;
+
+  if (numel % kVecBf16 != 0) {
+    if (rank == 0)
+      std::fprintf(stderr, "Error: m*n must be divisible by %d\n", kVecBf16);
     MPI_Finalize();
     return 1;
   }
-  if (static_cast<size_t>(rank) >= devices.size()) {
-    std::cerr << "Rank " << rank << " requires GPU device[" << rank
-              << "], but only " << devices.size() << " devices are available" << std::endl;
+  if (numel % (kVecBf16 * world_size) != 0) {
+    if (rank == 0)
+      std::fprintf(stderr, "Error: m*n must be divisible by %d (vec_width * world_size)\n",
+                   kVecBf16 * world_size);
     MPI_Finalize();
     return 1;
   }
 
-  bool ok = false;
-  try {
-    Runner runner;
-    ok = runner.run(options, devices[rank], rank, world_size);
-  } catch (std::exception const& e) {
-    std::cerr << "[rank " << rank << "] " << e.what() << std::endl;
-    MPI_Abort(MPI_COMM_WORLD, 1);
+  // Select GPU device (one per rank)
+  auto devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+  if ((int)devices.size() < world_size) {
+    if (rank == 0)
+      std::fprintf(stderr, "Need %d GPUs, found %zu\n", world_size, (size_t)devices.size());
+    MPI_Finalize();
+    return 1;
   }
+
+  sycl::device dev = devices[rank];
+  sycl::context ctx(dev);
+  sycl::queue q(ctx, dev, sycl::property_list{sycl::property::queue::in_order{}});
+
+  // Allocate input, output, and signal pad
+  bf16* in_buf = sycl::malloc_device<bf16>(numel, q);
+  bf16* out_buf = sycl::malloc_device<bf16>(numel, q);
+  bf16* ipc_out_buf = sycl::malloc_device<bf16>(numel, q);  // IPC-visible for RS+AG
+  uint32_t* sig_buf = sycl::malloc_device<uint32_t>(kSignalPadU32Slots_AR, q);
+  q.memset(sig_buf, 0, kSignalPadU32Slots_AR * sizeof(uint32_t)).wait();
+  q.memset(ipc_out_buf, 0, numel * sizeof(bf16)).wait();
+
+  // Fill input with rank+1
+  q.submit([&](sycl::handler& h) {
+    bf16 val = (bf16)(float)(rank + 1);
+    bf16* p = in_buf;
+    h.parallel_for(sycl::range<1>(numel), [=](sycl::id<1> i) { p[i] = val; });
+  }).wait();
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  // IPC exchange (same as bench_oneshot_vs_ccl)
+  std::vector<void*> opened_in, opened_sig, opened_out;
+  auto peer_in = exchange_ipc_ptrs(in_buf, rank, world_size, q, opened_in);
+  auto peer_sig = exchange_ipc_ptrs(sig_buf, rank, world_size, q, opened_sig);
+  auto peer_out = exchange_ipc_ptrs(ipc_out_buf, rank, world_size, q, opened_out);
+
+  // Make peer memory resident on local device
+  auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(ctx);
+  auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(dev);
+  for (int r = 0; r < world_size; ++r) {
+    if (r != rank) {
+      zeContextMakeMemoryResident(ze_ctx, ze_dev, peer_in[r], numel * sizeof(bf16));
+      zeContextMakeMemoryResident(ze_ctx, ze_dev, peer_out[r], numel * sizeof(bf16));
+      zeContextMakeMemoryResident(ze_ctx, ze_dev, peer_sig[r],
+                                  kSignalPadU32Slots_AR * sizeof(uint32_t));
+    }
+  }
+
+  // Upload peer pointer tables to device
+  bf16** d_peer_in = sycl::malloc_device<bf16*>(world_size, q);
+  bf16** d_peer_out = sycl::malloc_device<bf16*>(world_size, q);
+  uint32_t** d_peer_sig = sycl::malloc_device<uint32_t*>(world_size, q);
+  {
+    std::vector<bf16*> h_in(world_size);
+    std::vector<bf16*> h_out(world_size);
+    std::vector<uint32_t*> h_sig(world_size);
+    for (int r = 0; r < world_size; ++r) {
+      h_in[r] = reinterpret_cast<bf16*>(peer_in[r]);
+      h_out[r] = reinterpret_cast<bf16*>(peer_out[r]);
+      h_sig[r] = reinterpret_cast<uint32_t*>(peer_sig[r]);
+    }
+    q.memcpy(d_peer_in, h_in.data(), world_size * sizeof(bf16*));
+    q.memcpy(d_peer_out, h_out.data(), world_size * sizeof(bf16*));
+    q.memcpy(d_peer_sig, h_sig.data(), world_size * sizeof(uint32_t*));
+    q.wait();
+  }
+
+  // Compute launch config
+  int64_t groups, threads;
+  get_launch_cfg(numel, groups, threads);
+
+  int64_t rsag_groups, rsag_threads;
+  get_rsag_launch_cfg(numel, world_size, rsag_groups, rsag_threads);
+
+  if (rank == 0) {
+    std::printf("[allreduce-standalone] m=%d, n=%d, numel=%lld (%lld bytes)\n",
+                m, n, (long long)numel, (long long)(numel * sizeof(bf16)));
+    std::printf("[allreduce-standalone] all-to-all: groups=%lld, threads=%lld\n",
+                (long long)groups, (long long)threads);
+    std::printf("[allreduce-standalone] RS+AG:      groups=%lld, threads=%lld (vec=%dB)\n\n",
+                (long long)rsag_groups, (long long)rsag_threads, kVecBytes);
+  }
+
+  // Lambda to launch kernel (world_size dispatch)
+  auto run_alltoall = [&]() {
+    auto do_submit = [&](auto ws_const) {
+      constexpr int kWS = decltype(ws_const)::value;
+      FusedOneShotKernel_AR<kWS> ker{d_peer_in, out_buf, d_peer_sig, numel, rank};
+      q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(groups * threads, threads), ker);
+      });
+    };
+    switch (world_size) {
+      case 1:  do_submit(std::integral_constant<int, 1>{}); break;
+      case 2:  do_submit(std::integral_constant<int, 2>{}); break;
+      case 3:  do_submit(std::integral_constant<int, 3>{}); break;
+      case 4:  do_submit(std::integral_constant<int, 4>{}); break;
+      case 5:  do_submit(std::integral_constant<int, 5>{}); break;
+      case 6:  do_submit(std::integral_constant<int, 6>{}); break;
+      case 7:  do_submit(std::integral_constant<int, 7>{}); break;
+      case 8:  do_submit(std::integral_constant<int, 8>{}); break;
+      default:
+        throw std::runtime_error("world_size must be in [1, 8].");
+    }
+  };
+
+  // Lambda for reduce-scatter + allgather kernel
+  auto run_rs_ag = [&]() {
+    auto do_submit = [&](auto ws_const) {
+      constexpr int kWS = decltype(ws_const)::value;
+      ReduceScatterAllgatherKernel<kWS> ker{
+          d_peer_in, d_peer_out, ipc_out_buf, d_peer_sig, numel, rank};
+      q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(rsag_groups * rsag_threads, rsag_threads), ker);
+      });
+    };
+    switch (world_size) {
+      case 1:  do_submit(std::integral_constant<int, 1>{}); break;
+      case 2:  do_submit(std::integral_constant<int, 2>{}); break;
+      case 3:  do_submit(std::integral_constant<int, 3>{}); break;
+      case 4:  do_submit(std::integral_constant<int, 4>{}); break;
+      case 5:  do_submit(std::integral_constant<int, 5>{}); break;
+      case 6:  do_submit(std::integral_constant<int, 6>{}); break;
+      case 7:  do_submit(std::integral_constant<int, 7>{}); break;
+      case 8:  do_submit(std::integral_constant<int, 8>{}); break;
+      default:
+        throw std::runtime_error("world_size must be in [1, 8].");
+    }
+  };
+
+  using clk = std::chrono::high_resolution_clock;
+
+  // === Benchmark 1: All-to-all (original) ===
+  for (int i = 0; i < options.warmup; ++i) { run_alltoall(); q.wait(); }
+  MPI_Barrier(MPI_COMM_WORLD);
+  auto t0 = clk::now();
+  for (int iter = 0; iter < options.iterations; ++iter) {
+    run_alltoall();
+    q.wait();
+  }
+  auto t1 = clk::now();
+  double us_alltoall = std::chrono::duration<double, std::micro>(t1 - t0).count() / options.iterations;
+
+  // === Benchmark 2: Reduce-scatter + Allgather ===
+  // Reset signal pads between different kernel types
+  q.memset(sig_buf, 0, kSignalPadU32Slots_AR * sizeof(uint32_t)).wait();
+  MPI_Barrier(MPI_COMM_WORLD);
+
+  for (int i = 0; i < options.warmup; ++i) { run_rs_ag(); q.wait(); }
+  MPI_Barrier(MPI_COMM_WORLD);
+  t0 = clk::now();
+  for (int iter = 0; iter < options.iterations; ++iter) {
+    run_rs_ag();
+    q.wait();
+  }
+  t1 = clk::now();
+  double us_rs_ag = std::chrono::duration<double, std::micro>(t1 - t0).count() / options.iterations;
+
+  if (rank == 0) {
+    double bytes = (double)(numel * sizeof(bf16));
+    std::printf("\n=== Results (m=%d, n=%d, %lld bytes, ws=%d) ===\n",
+                m, n, (long long)(numel * sizeof(bf16)), world_size);
+    std::printf("  All-to-all:              %8.2f us  (%.3f GB/s)\n",
+                us_alltoall, bytes / (us_alltoall * 1e-6) / (1ULL << 30));
+    std::printf("  Reduce-scatter+Allgather: %8.2f us  (%.3f GB/s)\n",
+                us_rs_ag, bytes / (us_rs_ag * 1e-6) / (1ULL << 30));
+    std::printf("  Speedup: %.2fx\n\n", us_alltoall / us_rs_ag);
+  }
+
+  // Verification
+  bool passed = true;
+  if (options.verify != 0) {
+    std::vector<float> host_gpu(numel);
+    {
+      std::vector<bf16> tmp(numel);
+      q.memcpy(tmp.data(), ipc_out_buf, numel * sizeof(bf16)).wait();
+      for (int64_t i = 0; i < numel; ++i)
+        host_gpu[i] = (float)tmp[i];
+    }
+
+    std::vector<float> host_local(numel, (float)(rank + 1));
+    std::vector<float> host_ref(numel);
+    MPI_Allreduce(host_local.data(), host_ref.data(),
+                  (int)numel, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+
+    size_t mismatch = 0;
+    double max_abs = 0.0, max_rel = 0.0;
+    for (int64_t i = 0; i < numel; ++i) {
+      double ref = (double)host_ref[i];
+      double got = (double)host_gpu[i];
+      double diff = std::abs(ref - got);
+      double rel = (std::abs(ref) > 1e-6) ? diff / std::abs(ref) : diff;
+      max_abs = std::max(max_abs, diff);
+      max_rel = std::max(max_rel, rel);
+      if (rel > 1e-2) ++mismatch;
+    }
+
+    passed = (mismatch == 0);
+    std::printf("[rank %d] verify %s ref[0]=%.3f gpu[0]=%.3f "
+                "max_abs=%.6e max_rel=%.6e mismatch=%zu/%lld\n",
+                rank, passed ? "PASSED" : "FAILED",
+                host_ref[0], host_gpu[0],
+                max_abs, max_rel, mismatch, (long long)numel);
+  }
+
+  // Cleanup
+  close_ipc_ptrs(q, opened_in);
+  close_ipc_ptrs(q, opened_out);
+  close_ipc_ptrs(q, opened_sig);
+  sycl::free(d_peer_in, q);
+  sycl::free(d_peer_out, q);
+  sycl::free(d_peer_sig, q);
+  sycl::free(in_buf, q);
+  sycl::free(out_buf, q);
+  sycl::free(ipc_out_buf, q);
+  sycl::free(sig_buf, q);
 
   MPI_Finalize();
-  return ok ? 0 : 1;
+  return passed ? 0 : 1;
 }
