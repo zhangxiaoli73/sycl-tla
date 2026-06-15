@@ -74,6 +74,12 @@ auto choose_tiled_mma_ar(ATensor const& A, BTensor const& B, CTensor const&) {
 // GemmAllreduceParams: all kernel parameters for the fused GEMM + Allreduce kernel
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Base offset in signal buffer for reduce-scatter/allgather per-WG barrier.
+// Must not overlap with tile completion flags which use offsets [0, world_size * num_tiles).
+constexpr int kRSBarrierBaseU32 = 4096;
+// Maximum number of reducer WGs supported for RS+AG barrier slots.
+constexpr int kRSAG_MaxReducerWGs = 32;
+
 struct GemmAllreduceParams {
   // GEMM parameters (pointers are raw device pointers)
   void const* A;              // [M, K] bfloat16, RowMajor
@@ -104,6 +110,9 @@ struct GemmAllreduceParams {
   // Output
   SyclBF16* D;                // [M, N] final reduced output
   int ldd;                    // leading dimension of D
+
+  // IPC pointers to peers' D (output) buffers for allgather phase
+  SyclBF16** remote_out_ptrs_dev;  // [world_size] pointers to peer D buffers
 
   // Mode selection
   bool use_push_mode;         // true=push, false=pull
@@ -309,7 +318,7 @@ void gemm_and_push(
   }
 
   // ---- Write to local data_slots[my_rank] via copy_c ----
-  copy(copy_c, tCrC, tCgC);
+  copy(copy_c, tCrC, tCgC); // data from register to local HBM
 
   // Release fence: ensures data write is globally visible before flag write.
   // This is the critical ordering guarantee — remote rank must not see flag
@@ -334,10 +343,40 @@ void gemm_and_push(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Reducer WG: subgroup-level division — each subgroup handles a subset of tiles
+// Reducer WG: Reduce-Scatter + Allgather (RS+AG) strategy
+//
+// Phase 1 (Reduce-Scatter): Each rank reduces only its 1/world_size chunk.
+// Phase 2 (Allgather): Each rank reads other ranks' reduced chunks from their output.
+// Total cross-device reads: 2 * (world_size-1)/world_size * M*N
+//   vs all-to-all: (world_size-1) * M*N
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline uint32_t allreduce_load_acquire_u32(uint32_t* addr);
+
+// Per-WG cross-rank barrier for RS→AG synchronization.
+// Uses signal slots at kRSBarrierBaseU32 offset in each rank's flag buffer.
+inline void rs_ag_wg_barrier(
+    sycl::nd_item<2> item,
+    int reducer_wg_id,
+    GemmAllreduceParams const& params) {
+  const auto lid = int(item.get_local_id(0));
+
+  if (lid < params.world_size) {
+    int peer = lid;
+    if (peer != params.my_rank) {
+      // Signal peer: write signal_token to peer's flag buffer at our slot
+      uint32_t* put_addr = params.remote_flags_dev[peer] +
+          kRSBarrierBaseU32 + reducer_wg_id * params.world_size + params.my_rank;
+      put_signal<std::memory_order_release>(put_addr);
+
+      // Wait for peer's signal on our local flag buffer
+      uint32_t* wait_addr = params.local_flags +
+          kRSBarrierBaseU32 + reducer_wg_id * params.world_size + peer;
+      wait_signal<std::memory_order_acquire>(wait_addr);
+    }
+  }
+  sycl::group_barrier(item.get_group());
+}
 
 inline void reducer_work_subgroup(
     sycl::nd_item<2> item,
@@ -361,21 +400,17 @@ inline void reducer_work_subgroup(
   using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
   using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
 
-  // --- Flat parallel strategy ---
-  // All reducer threads cooperate on the ENTIRE output matrix (M*N elements).
-  // Step 1: Thread 0 of WG 0 waits for ALL tiles to be ready.
-  // Step 2: All threads do flat-parallel reduction across the full output.
-
   int64_t total_elems = static_cast<int64_t>(params.M) * params.N;
-  int64_t total_vec_elems = total_elems / BF16_PER_VEC;
-  int64_t rank_slot_vec_stride = total_vec_elems;
   int64_t rank_slot_elem_stride = total_elems;
 
-  // Step 1: All reducer WGs poll ALL tiles' flags.
-  // Each WG's thread 0 checks all flags — this ensures every WG knows all data is ready
-  // before any thread starts reduction.
+  // Step 1: Each reducer WG polls only its assigned tiles' flags.
+  // Tile assignment matches legacy reducer partitioning:
+  //   tile_idx = reducer_wg_id + k * num_active_reducer_wgs
+  // This avoids a global full-tile wait in every reducer WG.
   if (local_id == 0) {
-    for (int tile_idx = 0; tile_idx < total_output_tiles; ++tile_idx) {
+    for (int tile_idx = reducer_wg_id;
+         tile_idx < total_output_tiles;
+         tile_idx += num_active_reducer_wgs) {
       int tile_m = tile_idx / params.num_n_tiles;
       int tile_n = tile_idx % params.num_n_tiles;
       for (int src = 0; src < params.world_size; ++src) {
@@ -395,36 +430,47 @@ inline void reducer_work_subgroup(
   // Acquire fence: ensures subsequent data reads see committed data
   sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
 
-  // Step 2: Flat parallel reduction — all reducer threads cooperate on full output
+  // ===== Phase 1: Reduce-Scatter =====
+  // Each rank reduces only its 1/world_size chunk of the output.
+  // Chunk for rank r: elements [r * chunk_elems, (r+1) * chunk_elems)
+  int64_t chunk_elems = total_elems / params.world_size;
+  int64_t chunk_vecs = chunk_elems / BF16_PER_VEC;
+  int64_t my_chunk_start = static_cast<int64_t>(params.my_rank) * chunk_elems;
+
   int64_t global_thread_id = static_cast<int64_t>(reducer_wg_id) * wg_size + local_id;
   int64_t total_reducer_threads = static_cast<int64_t>(num_active_reducer_wgs) * wg_size;
 
   auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
   auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
 
-  for (int64_t vi = global_thread_id; vi < total_vec_elems; vi += total_reducer_threads) {
+  // Vectorized RS: reduce my chunk from all peers' GEMM data
+  for (int64_t vi = global_thread_id; vi < chunk_vecs; vi += total_reducer_threads) {
+    int64_t elem_offset = my_chunk_start + vi * BF16_PER_VEC;
+    int64_t vec_offset = elem_offset / BF16_PER_VEC;
+
     // Start with own rank's data
-    int src0 = params.my_rank;
-    auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src0]);
-    BF16Vec sum = buf0[static_cast<int64_t>(src0) * rank_slot_vec_stride + vi]
+    auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[params.my_rank]);
+    BF16Vec sum = buf0[static_cast<int64_t>(params.my_rank) * (total_elems / BF16_PER_VEC) + vec_offset]
                       .template as<BF16Vec>();
 
-    // Accumulate from all other ranks (rank rotation for balanced access)
+    // Accumulate from all other ranks
     #pragma unroll 8
     for (int step = 1; step < params.world_size; ++step) {
       int src = (params.my_rank + step) % params.world_size;
       auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
-      sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride + vi]
+      sum += buf[static_cast<int64_t>(src) * (total_elems / BF16_PER_VEC) + vec_offset]
                  .template as<BF16Vec>();
     }
 
-    out_vec[vi] = sum.template as<LoadVec>();
+    // Write reduced chunk to local output (D is IPC-visible for allgather)
+    out_vec[vec_offset] = sum.template as<LoadVec>();
   }
 
-  // Scalar tail: thread 0 of WG 0 handles remainder
+  // Scalar tail for Phase 1
   if (global_thread_id == 0) {
-    int64_t scalar_begin = total_vec_elems * BF16_PER_VEC;
-    for (int64_t i = scalar_begin; i < total_elems; ++i) {
+    int64_t scalar_begin = my_chunk_start + chunk_vecs * BF16_PER_VEC;
+    int64_t scalar_end = my_chunk_start + chunk_elems;
+    for (int64_t i = scalar_begin; i < scalar_end; ++i) {
       float acc = 0.0f;
       for (int step = 0; step < params.world_size; ++step) {
         int src = (params.my_rank + step) % params.world_size;
@@ -436,9 +482,49 @@ inline void reducer_work_subgroup(
     }
   }
 
+  // Release fence: ensure RS writes are globally visible before signaling peers
+  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+
+  // ===== Mid-barrier: per-WG cross-rank barrier =====
+  // Each WG signals all peers and waits for all peers' WG to finish RS.
+  rs_ag_wg_barrier(item, reducer_wg_id, params);
+
+  // ===== Phase 2: Allgather =====
+  // Copy other ranks' reduced chunks from their D buffers into local output.
+  int64_t total_ag_vecs = chunk_vecs * (params.world_size - 1);
+
+  for (int64_t flat = global_thread_id; flat < total_ag_vecs; flat += total_reducer_threads) {
+    int step = static_cast<int>(flat / chunk_vecs) + 1;
+    int64_t vi = flat % chunk_vecs;
+    int src = (params.my_rank + step) % params.world_size;
+    int64_t src_chunk_start = static_cast<int64_t>(src) * chunk_elems;
+    int64_t elem_offset = src_chunk_start + vi * BF16_PER_VEC;
+    int64_t vec_offset = elem_offset / BF16_PER_VEC;
+
+    // Read from peer's D buffer (IPC-visible output)
+    auto* peer_out = reinterpret_cast<LoadVec const*>(params.remote_out_ptrs_dev[src]);
+    LoadVec val = peer_out[vec_offset];
+    out_vec[vec_offset] = val;
+  }
+
+  // Scalar tail for Phase 2
+  if (global_thread_id == 0) {
+    for (int step = 1; step < params.world_size; ++step) {
+      int src = (params.my_rank + step) % params.world_size;
+      int64_t src_chunk_start = static_cast<int64_t>(src) * chunk_elems;
+      int64_t scalar_begin = src_chunk_start + chunk_vecs * BF16_PER_VEC;
+      int64_t scalar_end = src_chunk_start + chunk_elems;
+      auto* peer_out = reinterpret_cast<SyclBF16 const*>(params.remote_out_ptrs_dev[src]);
+      for (int64_t i = scalar_begin; i < scalar_end; ++i) {
+        out_scalar[i] = peer_out[i];
+      }
+    }
+  }
+
   if (debug_log && local_id == 0 && reducer_wg_id == 0) {
-    printf("[AR-REDUCE-FLAT] rank=%d, total_threads=%lld, vec_elems=%lld\n",
-           params.my_rank, (long long)total_reducer_threads, (long long)total_vec_elems);
+    printf("[AR-RS+AG] rank=%d, total_threads=%lld, chunk_vecs=%lld, world_size=%d\n",
+           params.my_rank, (long long)total_reducer_threads, (long long)chunk_vecs,
+           params.world_size);
   }
 }
 
@@ -573,6 +659,7 @@ void gemm_allreduce_device(
     float alpha,
     int** ipc_signal_ptrs,
     void** ipc_data_ptrs,
+    void** ipc_out_ptrs,
     uint32_t signal_token,
     bool use_push_mode,
     int rank,
@@ -630,6 +717,7 @@ void gemm_allreduce_device(
   params.remote_flags_dev = reinterpret_cast<uint32_t**>(ipc_signal_ptrs);
   params.D = reinterpret_cast<SyclBF16*>(D.data().get());
   params.ldd = stride<0>(D);
+  params.remote_out_ptrs_dev = reinterpret_cast<SyclBF16**>(ipc_out_ptrs);
   params.use_push_mode = true;  // Push flags to remote
   params.signal_token = signal_token;
   params.max_active_reducer_wgs = num_reducer_wgs;

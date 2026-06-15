@@ -93,6 +93,10 @@ struct ExampleRunner {
 	int* signal_local_ = nullptr;
 	int num_tiles_ = 0;
 
+	// IPC output pointers for RS+AG allgather phase
+	std::vector<void*> opened_out_bases_;
+	void** ipc_out_ptrs_dev_ = nullptr;
+
 	void initialize_tile_signals(int m, int n, int k, int rank, int world_size,
 	                             TensorA_t const& A, TensorB_t const& B, TensorC_t const& C_meta) {
 		auto mma = choose_tiled_mma_ar(A, B, C_meta);
@@ -102,6 +106,10 @@ struct ExampleRunner {
 		int num_n_tiles = int(ceil_div(n, tile_n));
 		num_tiles_ = num_m_tiles * num_n_tiles;
 		size_t signal_elems = static_cast<size_t>(num_tiles_) * world_size;
+		// Ensure signal buffer is large enough for RS+AG per-WG barrier slots
+		size_t rs_barrier_size = static_cast<size_t>(kRSBarrierBaseU32)
+		    + static_cast<size_t>(kRSAG_MaxReducerWGs) * world_size;
+		signal_elems = std::max(signal_elems, rs_barrier_size);
 
 		if (!symm_) {
 			size_t override_data_elems = static_cast<size_t>(m) * n * world_size;
@@ -133,6 +141,7 @@ struct ExampleRunner {
 			int num_n_tiles,
 			void** ipc_data_ptrs,
 			int** ipc_signal_ptrs,
+			void** ipc_out_ptrs,
 			float alpha,
 			uint32_t signal_token,
 			bool use_push_mode,
@@ -154,6 +163,7 @@ struct ExampleRunner {
 			    [=](sycl::nd_item<2>) {
 			        gemm_allreduce_device(A, B, C, D, mma, alpha,
 			                              ipc_signal_ptrs, ipc_data_ptrs,
+			                              ipc_out_ptrs,
 				                              signal_token,
 				                              use_push_mode,
 				                              rank, world_size, m, n, num_n_tiles,
@@ -327,8 +337,9 @@ struct ExampleRunner {
 		    local[1] * (int(ceil_div(m, tile_m)) + num_reducer_rows_v)};
 		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
 		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
+		void** ipc_out_ptrs_v = ipc_out_ptrs_dev_;
 		run_fused(A_t, B_t, C_t, D_t, mma, local, global, num_n_tiles,
-		          ipc_data_ptrs, ipc_signal_ptrs,
+		          ipc_data_ptrs, ipc_signal_ptrs, ipc_out_ptrs_v,
 		          options.alpha, 1u, options.use_push_mode != 0,
 		          rank, world_size, m, n, num_reducer_wgs_v,
 		          options.debug_log != 0);
@@ -403,6 +414,11 @@ struct ExampleRunner {
 
 		auto cleanup = [&]() {
 			release_tile_signals();
+			close_ipc_ptrs(*q_, opened_out_bases_);
+			if (ipc_out_ptrs_dev_) {
+				sycl::free(ipc_out_ptrs_dev_, *q_);
+				ipc_out_ptrs_dev_ = nullptr;
+			}
 			if (block_A) sycl::free(block_A, *q_);
 			if (block_B) sycl::free(block_B, *q_);
 			if (block_D) sycl::free(block_D, *q_);
@@ -418,6 +434,24 @@ struct ExampleRunner {
 
 		// Initialize tile-level IPC signals and create SymmMemory (once)
 		initialize_tile_signals(m, n, k, rank, world_size, A, B, C_meta);
+
+		// Exchange IPC for output buffer D (needed for RS+AG allgather phase)
+		{
+			auto peer_out = exchange_ipc_ptrs(block_D, rank, world_size, *q_, opened_out_bases_);
+			ipc_out_ptrs_dev_ = sycl::malloc_device<void*>(world_size, *q_);
+			q_->memcpy(ipc_out_ptrs_dev_, peer_out.data(), world_size * sizeof(void*)).wait();
+
+			// Make peer output buffers resident on local device
+			auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_->get_context());
+			auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_->get_device());
+			for (int r = 0; r < world_size; ++r) {
+				if (r != rank) {
+					zeContextMakeMemoryResident(ze_ctx, ze_dev, peer_out[r],
+					    c_elems * sizeof(ElementC));
+				}
+			}
+		}
+		MPI_Barrier(MPI_COMM_WORLD);
 
 		// Build C/D tensors (reused for all iterations)
 		ElementC* local_p2p = reinterpret_cast<ElementC*>(symm_->local_data_ptr_);
@@ -453,6 +487,7 @@ struct ExampleRunner {
 		    local[1] * (num_m_tiles + num_reducer_rows)};
 		void** ipc_data_ptrs = reinterpret_cast<void**>(symm_->remote_data_ptrs_dev_);
 		int** ipc_signal_ptrs = reinterpret_cast<int**>(symm_->remote_signal_ptrs_dev_);
+		void** ipc_out_ptrs = ipc_out_ptrs_dev_;
 
 		if (rank == 0) {
 			printf("[rank %d] Grid: %d GEMM WGs + %d reducer WGs (%d requested), "
@@ -485,7 +520,7 @@ struct ExampleRunner {
 		for (int iter = 0; iter < kWarmupIters; ++iter) {
 			// Only log on the first warmup iteration to avoid flooding
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
-			          ipc_data_ptrs, ipc_signal_ptrs,
+			          ipc_data_ptrs, ipc_signal_ptrs, ipc_out_ptrs,
 			          options.alpha, next_signal_token(), options.use_push_mode != 0,
 			          rank, world_size, m, n, num_reducer_wgs,
 			          enable_debug_log && (iter == 0));
@@ -498,7 +533,7 @@ struct ExampleRunner {
 		auto benchmark_start = std::chrono::high_resolution_clock::now();
 		for (int iter = 0; iter < options.iterations; ++iter) {
 			run_fused(A, B, C, D, mma, local, global, num_n_tiles,
-			          ipc_data_ptrs, ipc_signal_ptrs,
+			          ipc_data_ptrs, ipc_signal_ptrs, ipc_out_ptrs,
 			          options.alpha, next_signal_token(), options.use_push_mode != 0,
 			          rank, world_size, m, n, num_reducer_wgs);
 		}
