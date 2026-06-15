@@ -106,10 +106,11 @@ struct ExampleRunner {
 		int num_n_tiles = int(ceil_div(n, tile_n));
 		num_tiles_ = num_m_tiles * num_n_tiles;
 		size_t signal_elems = static_cast<size_t>(num_tiles_) * world_size;
-		// Ensure signal buffer is large enough for RS+AG per-WG barrier slots
-		size_t rs_barrier_size = static_cast<size_t>(kRSBarrierBaseU32)
-		    + static_cast<size_t>(kRSAG_MaxReducerWGs) * world_size;
-		signal_elems = std::max(signal_elems, rs_barrier_size);
+		// Ensure signal buffer is large enough for rs_flag + ag_flag
+		// ag_flag: kAGFlagBaseU32 + world_size * num_tiles
+		size_t ag_flag_size = static_cast<size_t>(kAGFlagBaseU32)
+		    + static_cast<size_t>(world_size) * num_tiles_;
+		signal_elems = std::max(signal_elems, ag_flag_size);
 
 		if (!symm_) {
 			size_t override_data_elems = static_cast<size_t>(m) * n * world_size;

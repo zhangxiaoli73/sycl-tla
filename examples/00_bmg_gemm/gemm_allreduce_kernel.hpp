@@ -76,9 +76,11 @@ auto choose_tiled_mma_ar(ATensor const& A, BTensor const& B, CTensor const&) {
 
 // Base offset in signal buffer for reduce-scatter/allgather per-WG barrier.
 // Must not overlap with tile completion flags which use offsets [0, world_size * num_tiles).
-constexpr int kRSBarrierBaseU32 = 4096;
-// Maximum number of reducer WGs supported for RS+AG barrier slots.
-constexpr int kRSAG_MaxReducerWGs = 32;
+// Flag layout in signal buffer:
+// [0, world_size * num_tiles):          rs_flag (Flag A) — "GEMM tile done, symm_input ready"
+// [kAGFlagBaseU32, + world_size * num_tiles): ag_flag (Flag B) — "RS tile done, symm_rs ready"
+constexpr int kAGFlagBaseU32 = 4096;
+constexpr int kMaxTilesForFlags = 1024;  // supports up to 1024 tiles (32x32 grid)
 
 struct GemmAllreduceParams {
   // GEMM parameters (pointers are raw device pointers)
@@ -222,8 +224,10 @@ void gemm_device(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Fused GEMM + Allreduce (pull-only): GEMM WG computes tile and signals completion
+// Fused GEMM + Allreduce: GEMM WG computes tile, writes to symm_input, pushes rs_flag
 /////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline uint32_t allreduce_load_acquire_u32(uint32_t* addr);
 
 template <class ATensor, class BTensor, class CTensor, class TiledMMA>
 void gemm_and_push(
@@ -232,14 +236,15 @@ void gemm_and_push(
     CTensor& C_local,       // (M,N) — local data_slots[my_rank], used for copy_c setup
     TiledMMA const& mma,
     float alpha,
-    GemmAllreduceParams const& params) {
+    GemmAllreduceParams const& params,
+    int tile_m,             // explicit tile row coordinate
+    int tile_n) {           // explicit tile col coordinate
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<2>();
-  auto wg_m = int(item.get_group(1));
-  auto wg_n = int(item.get_group(0));
   auto local_id = int(item.get_local_id(0));
 
-  // ---- Standard GEMM mainloop (unchanged) ----
+  int wg_m = tile_m;
+  int wg_n = tile_n;
   Tensor cA = make_identity_tensor(A.shape());
   Tensor cB = make_identity_tensor(B.shape());
   Tensor cC = make_identity_tensor(C_local.shape());
@@ -317,214 +322,231 @@ void gemm_and_push(
     tCrC(i) = tCrC(i) * alpha_elem;
   }
 
-  // ---- Write to local data_slots[my_rank] via copy_c ----
-  copy(copy_c, tCrC, tCgC); // data from register to local HBM
+  // Write to local symm_input_buffer (data_slots[my_rank])
+  copy(copy_c, tCrC, tCgC);
 
+  // Group barrier: ensures ALL threads' data writes have completed before flag push.
+  sycl::group_barrier(item.get_group());
   // Release fence: ensures data write is globally visible before flag write.
-  // This is the critical ordering guarantee — remote rank must not see flag
-  // before data is committed.
   sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
 
-  // Push flags to ALL remote ranks' local flag buffers and own local flags.
-  // This way consumers only poll their own local memory (fast local reads).
+  // Push rs_flag to ALL remote ranks and own local flags.
   if (local_id == 0) {
     int tile_linear_id = wg_m * params.num_n_tiles + wg_n;
     int flag_idx = params.my_rank * params.num_m_tiles * params.num_n_tiles + tile_linear_id;
 
-    // Write to own local flags (for local reducer to see)
+    // Write to own local rs_flag
     params.local_flags[flag_idx] = params.signal_token;
 
-    // Push flag to each remote rank's flag buffer
+    // Push rs_flag to each remote rank
     for (int peer = 0; peer < params.world_size; ++peer) {
       if (peer == params.my_rank) continue;
       params.remote_flags_dev[peer][flag_idx] = params.signal_token;
     }
   }
+  // GEMM WG exits here — no inline RS, no blocking
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
-// Reducer WG: Reduce-Scatter + Allgather (RS+AG) strategy
+// wg_rs: ReduceScatter workgroup
 //
-// Phase 1 (Reduce-Scatter): Each rank reduces only its 1/world_size chunk.
-// Phase 2 (Allgather): Each rank reads other ranks' reduced chunks from their output.
-// Total cross-device reads: 2 * (world_size-1)/world_size * M*N
-//   vs all-to-all: (world_size-1) * M*N
+// Spin-checks rs_flag for tiles in MY chunk. Once all ranks' flags for a tile are ready,
+// pulls remote symm_input data, reduces, writes to local D (symm_rs_buffer), then
+// pushes ag_flag to all remote peers.
+//
+// Tile assignment: static striped across wg_rs WGs.
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline uint32_t allreduce_load_acquire_u32(uint32_t* addr);
 
-// Per-WG cross-rank barrier for RS→AG synchronization.
-// Uses signal slots at kRSBarrierBaseU32 offset in each rank's flag buffer.
-inline void rs_ag_wg_barrier(
+inline void rs_work(
     sycl::nd_item<2> item,
-    int reducer_wg_id,
-    GemmAllreduceParams const& params) {
-  const auto lid = int(item.get_local_id(0));
-
-  if (lid < params.world_size) {
-    int peer = lid;
-    if (peer != params.my_rank) {
-      // Signal peer: write signal_token to peer's flag buffer at our slot
-      uint32_t* put_addr = params.remote_flags_dev[peer] +
-          kRSBarrierBaseU32 + reducer_wg_id * params.world_size + params.my_rank;
-      put_signal<std::memory_order_release>(put_addr);
-
-      // Wait for peer's signal on our local flag buffer
-      uint32_t* wait_addr = params.local_flags +
-          kRSBarrierBaseU32 + reducer_wg_id * params.world_size + peer;
-      wait_signal<std::memory_order_acquire>(wait_addr);
-    }
-  }
-  sycl::group_barrier(item.get_group());
-}
-
-inline void reducer_work_subgroup(
-    sycl::nd_item<2> item,
-    int reducer_wg_id,
-    int num_active_reducer_wgs,
+    int rs_wg_id,
+    int num_rs_wgs,
     GemmAllreduceParams const& params,
     bool debug_log = false) {
 
-  int total_output_tiles = params.num_m_tiles * params.num_n_tiles;
   int local_id = int(item.get_local_id(0));
   int wg_size = int(item.get_local_range(0));
 
-  // Early exit for excess reducer WGs beyond the active limit
-  if (reducer_wg_id >= num_active_reducer_wgs) {
+  if (rs_wg_id >= num_rs_wgs) {
     return;
   }
 
-  constexpr int NUM_PER_TH = 4;  // 4 × int64_t = 32 bytes = 16 bf16
-  constexpr int BF16_PER_VEC = NUM_PER_TH * 4;  // 16 bf16 per vector load
-
+  constexpr int NUM_PER_TH = 4;
+  constexpr int BF16_PER_VEC = NUM_PER_TH * 4;  // 16 bf16 per vector
   using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
   using BF16Vec = sycl::vec<SyclBF16, BF16_PER_VEC>;
 
-  int64_t total_elems = static_cast<int64_t>(params.M) * params.N;
-  int64_t rank_slot_elem_stride = total_elems;
+  int num_tiles = params.num_m_tiles * params.num_n_tiles;
+  int chunk_m_tiles = params.num_m_tiles / params.world_size;
+  int my_chunk_start_row = params.my_rank * chunk_m_tiles;
+  int tiles_per_chunk = chunk_m_tiles * params.num_n_tiles;
 
-  // Step 1: Each reducer WG polls only its assigned tiles' flags.
-  // Tile assignment matches legacy reducer partitioning:
-  //   tile_idx = reducer_wg_id + k * num_active_reducer_wgs
-  // This avoids a global full-tile wait in every reducer WG.
-  if (local_id == 0) {
-    for (int tile_idx = reducer_wg_id;
-         tile_idx < total_output_tiles;
-         tile_idx += num_active_reducer_wgs) {
-      int tile_m = tile_idx / params.num_n_tiles;
-      int tile_n = tile_idx % params.num_n_tiles;
+  int64_t total_elems = static_cast<int64_t>(params.M) * params.N;
+  int64_t rank_slot_vec_stride = total_elems / BF16_PER_VEC;
+
+  auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
+
+  // Each wg_rs processes a strided subset of chunk tiles
+  for (int tile_idx = rs_wg_id; tile_idx < tiles_per_chunk; tile_idx += num_rs_wgs) {
+    int tile_m = my_chunk_start_row + tile_idx / params.num_n_tiles;
+    int tile_n = tile_idx % params.num_n_tiles;
+    int tile_linear_id = tile_m * params.num_n_tiles + tile_n;
+
+    // Spin-check rs_flag: wait for ALL ranks to have computed this tile
+    if (local_id == 0) {
       for (int src = 0; src < params.world_size; ++src) {
-        int flag_idx = src * params.num_m_tiles * params.num_n_tiles
-                     + tile_m * params.num_n_tiles + tile_n;
+        int flag_idx = src * num_tiles + tile_linear_id;
         uint32_t* flag_ptr = &params.local_flags[flag_idx];
         while (allreduce_load_acquire_u32(flag_ptr) != params.signal_token) {
-          // spin-wait
+          // spin-wait for rank src's GEMM output for this tile
         }
       }
     }
-  }
+    sycl::group_barrier(item.get_group());
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
 
-  // WG-level barrier: all threads in this WG wait until flags are confirmed
-  sycl::group_barrier(item.get_group());
+    // Pull remote data and reduce this tile
+    int tile_m_base = tile_m * 256;
+    int tile_n_base = tile_n * 256;
+    constexpr int tile_rows = 256;
+    constexpr int tile_cols = 256;
+    int64_t tile_elems = static_cast<int64_t>(tile_rows) * tile_cols;
+    int64_t vec_elems = tile_elems / BF16_PER_VEC;  // 4096 vectors per tile
 
-  // Acquire fence: ensures subsequent data reads see committed data
-  sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+    for (int64_t vi = local_id; vi < vec_elems; vi += wg_size) {
+      int64_t bf16_idx = vi * BF16_PER_VEC;
+      int row = static_cast<int>(bf16_idx / tile_cols);
+      int col = static_cast<int>(bf16_idx % tile_cols);
+      int64_t global_offset =
+          (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
+      int64_t global_vec_offset = global_offset / BF16_PER_VEC;
 
-  // ===== Phase 1: Reduce-Scatter =====
-  // Each rank reduces only its 1/world_size chunk of the output.
-  // Chunk for rank r: elements [r * chunk_elems, (r+1) * chunk_elems)
-  int64_t chunk_elems = total_elems / params.world_size;
-  int64_t chunk_vecs = chunk_elems / BF16_PER_VEC;
-  int64_t my_chunk_start = static_cast<int64_t>(params.my_rank) * chunk_elems;
+      // Start with my own rank's data (local read)
+      auto* buf0 = reinterpret_cast<LoadVec const*>(
+          params.remote_data_slots_dev[params.my_rank]);
+      BF16Vec sum = buf0[static_cast<int64_t>(params.my_rank) * rank_slot_vec_stride
+                         + global_vec_offset].template as<BF16Vec>();
 
-  int64_t global_thread_id = static_cast<int64_t>(reducer_wg_id) * wg_size + local_id;
-  int64_t total_reducer_threads = static_cast<int64_t>(num_active_reducer_wgs) * wg_size;
-
-  auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
-  auto* out_scalar = reinterpret_cast<SyclBF16*>(params.D);
-
-  // Vectorized RS: reduce my chunk from all peers' GEMM data
-  for (int64_t vi = global_thread_id; vi < chunk_vecs; vi += total_reducer_threads) {
-    int64_t elem_offset = my_chunk_start + vi * BF16_PER_VEC;
-    int64_t vec_offset = elem_offset / BF16_PER_VEC;
-
-    // Start with own rank's data
-    auto* buf0 = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[params.my_rank]);
-    BF16Vec sum = buf0[static_cast<int64_t>(params.my_rank) * (total_elems / BF16_PER_VEC) + vec_offset]
-                      .template as<BF16Vec>();
-
-    // Accumulate from all other ranks
-    #pragma unroll 8
-    for (int step = 1; step < params.world_size; ++step) {
-      int src = (params.my_rank + step) % params.world_size;
-      auto* buf = reinterpret_cast<LoadVec const*>(params.remote_data_slots_dev[src]);
-      sum += buf[static_cast<int64_t>(src) * (total_elems / BF16_PER_VEC) + vec_offset]
-                 .template as<BF16Vec>();
-    }
-
-    // Write reduced chunk to local output (D is IPC-visible for allgather)
-    out_vec[vec_offset] = sum.template as<LoadVec>();
-  }
-
-  // Scalar tail for Phase 1
-  if (global_thread_id == 0) {
-    int64_t scalar_begin = my_chunk_start + chunk_vecs * BF16_PER_VEC;
-    int64_t scalar_end = my_chunk_start + chunk_elems;
-    for (int64_t i = scalar_begin; i < scalar_end; ++i) {
-      float acc = 0.0f;
-      for (int step = 0; step < params.world_size; ++step) {
+      // Accumulate from remote ranks (ring order for anti-affinity)
+      #pragma unroll 8
+      for (int step = 1; step < params.world_size; ++step) {
         int src = (params.my_rank + step) % params.world_size;
-        auto* buf = reinterpret_cast<SyclBF16 const*>(params.remote_data_slots_dev[src]);
-        acc += static_cast<float>(
-            buf[static_cast<int64_t>(src) * rank_slot_elem_stride + i]);
+        auto* buf = reinterpret_cast<LoadVec const*>(
+            params.remote_data_slots_dev[src]);
+        sum += buf[static_cast<int64_t>(src) * rank_slot_vec_stride
+                   + global_vec_offset].template as<BF16Vec>();
       }
-      out_scalar[i] = static_cast<SyclBF16>(acc);
+
+      out_vec[global_vec_offset] = sum.template as<LoadVec>();
+    }
+
+    // Push ag_flag to ALL remote peers: "my D[tile] is ready for AG"
+    sycl::group_barrier(item.get_group());
+    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+    if (local_id == 0) {
+      int ag_flag_idx = params.my_rank * num_tiles + tile_linear_id;
+      // Write to local ag_flag
+      params.local_flags[kAGFlagBaseU32 + ag_flag_idx] = params.signal_token;
+      // Push to all remote peers
+      for (int peer = 0; peer < params.world_size; ++peer) {
+        if (peer == params.my_rank) continue;
+        params.remote_flags_dev[peer][kAGFlagBaseU32 + ag_flag_idx] = params.signal_token;
+      }
     }
   }
 
-  // Release fence: ensure RS writes are globally visible before signaling peers
-  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+  if (debug_log && local_id == 0 && rs_wg_id == 0) {
+    printf("[WG_RS] rank=%d, num_rs_wgs=%d, tiles_per_chunk=%d\n",
+           params.my_rank, num_rs_wgs, tiles_per_chunk);
+  }
+}
 
-  // ===== Mid-barrier: per-WG cross-rank barrier =====
-  // Each WG signals all peers and waits for all peers' WG to finish RS.
-  rs_ag_wg_barrier(item, reducer_wg_id, params);
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// wg_ag: Allgather workgroup
+//
+// Spin-checks ag_flag for tiles in OTHER ranks' chunks. Once a remote rank's ag_flag
+// for a tile is set, pulls that tile from the remote rank's D into local D.
+//
+// Tile assignment: static striped across wg_ag WGs.
+/////////////////////////////////////////////////////////////////////////////////////////////////
 
-  // ===== Phase 2: Allgather =====
-  // Copy other ranks' reduced chunks from their D buffers into local output.
-  int64_t total_ag_vecs = chunk_vecs * (params.world_size - 1);
+inline void ag_work(
+    sycl::nd_item<2> item,
+    int ag_wg_id,
+    int num_ag_wgs,
+    GemmAllreduceParams const& params,
+    bool debug_log = false) {
 
-  for (int64_t flat = global_thread_id; flat < total_ag_vecs; flat += total_reducer_threads) {
-    int step = static_cast<int>(flat / chunk_vecs) + 1;
-    int64_t vi = flat % chunk_vecs;
-    int src = (params.my_rank + step) % params.world_size;
-    int64_t src_chunk_start = static_cast<int64_t>(src) * chunk_elems;
-    int64_t elem_offset = src_chunk_start + vi * BF16_PER_VEC;
-    int64_t vec_offset = elem_offset / BF16_PER_VEC;
+  int local_id = int(item.get_local_id(0));
+  int wg_size = int(item.get_local_range(0));
 
-    // Read from peer's D buffer (IPC-visible output)
+  if (ag_wg_id >= num_ag_wgs) {
+    return;
+  }
+
+  constexpr int NUM_PER_TH = 4;
+  constexpr int BF16_PER_VEC = NUM_PER_TH * 4;
+  using LoadVec = sycl::vec<int64_t, NUM_PER_TH>;
+
+  int num_tiles = params.num_m_tiles * params.num_n_tiles;
+  int chunk_m_tiles = params.num_m_tiles / params.world_size;
+  int tiles_per_chunk = chunk_m_tiles * params.num_n_tiles;
+
+  // Total AG tiles: (world_size - 1) remote chunks
+  int total_ag_tiles = tiles_per_chunk * (params.world_size - 1);
+
+  // Each wg_ag processes a strided subset of AG tiles
+  for (int ag_idx = ag_wg_id; ag_idx < total_ag_tiles; ag_idx += num_ag_wgs) {
+    // Determine which remote rank and which tile
+    int step = ag_idx / tiles_per_chunk;  // 0-based (0 = first remote rank)
+    int tile_in_chunk = ag_idx % tiles_per_chunk;
+    int src = (params.my_rank + step + 1) % params.world_size;
+
+    // Compute tile coordinates
+    int src_chunk_start_row = src * chunk_m_tiles;
+    int tile_m = src_chunk_start_row + tile_in_chunk / params.num_n_tiles;
+    int tile_n = tile_in_chunk % params.num_n_tiles;
+    int tile_linear_id = tile_m * params.num_n_tiles + tile_n;
+
+    // Wait for ag_flag from src rank for this tile
+    if (local_id == 0) {
+      int ag_flag_idx = src * num_tiles + tile_linear_id;
+      uint32_t* flag_ptr = &params.local_flags[kAGFlagBaseU32 + ag_flag_idx];
+      while (allreduce_load_acquire_u32(flag_ptr) != params.signal_token) {
+        // spin-wait: src rank's RS for this tile not done yet
+      }
+    }
+    sycl::group_barrier(item.get_group());
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+
+    // Copy this tile from src's D to local D
+    int tile_m_base = tile_m * 256;
+    int tile_n_base = tile_n * 256;
+    constexpr int tile_rows = 256;
+    constexpr int tile_cols = 256;
+    int64_t tile_elems = static_cast<int64_t>(tile_rows) * tile_cols;
+    int64_t vec_elems = tile_elems / BF16_PER_VEC;  // 4096 vectors per tile
+
     auto* peer_out = reinterpret_cast<LoadVec const*>(params.remote_out_ptrs_dev[src]);
-    LoadVec val = peer_out[vec_offset];
-    out_vec[vec_offset] = val;
-  }
+    auto* out_vec = reinterpret_cast<LoadVec*>(params.D);
 
-  // Scalar tail for Phase 2
-  if (global_thread_id == 0) {
-    for (int step = 1; step < params.world_size; ++step) {
-      int src = (params.my_rank + step) % params.world_size;
-      int64_t src_chunk_start = static_cast<int64_t>(src) * chunk_elems;
-      int64_t scalar_begin = src_chunk_start + chunk_vecs * BF16_PER_VEC;
-      int64_t scalar_end = src_chunk_start + chunk_elems;
-      auto* peer_out = reinterpret_cast<SyclBF16 const*>(params.remote_out_ptrs_dev[src]);
-      for (int64_t i = scalar_begin; i < scalar_end; ++i) {
-        out_scalar[i] = peer_out[i];
-      }
+    for (int64_t vi = local_id; vi < vec_elems; vi += wg_size) {
+      int64_t bf16_idx = vi * BF16_PER_VEC;
+      int row = static_cast<int>(bf16_idx / tile_cols);
+      int col = static_cast<int>(bf16_idx % tile_cols);
+      int64_t global_offset =
+          (static_cast<int64_t>(tile_m_base + row) * params.N) + (tile_n_base + col);
+      int64_t global_vec_offset = global_offset / BF16_PER_VEC;
+
+      out_vec[global_vec_offset] = peer_out[global_vec_offset];
     }
   }
 
-  if (debug_log && local_id == 0 && reducer_wg_id == 0) {
-    printf("[AR-RS+AG] rank=%d, total_threads=%lld, chunk_vecs=%lld, world_size=%d\n",
-           params.my_rank, (long long)total_reducer_threads, (long long)chunk_vecs,
-           params.world_size);
+  if (debug_log && local_id == 0 && ag_wg_id == 0) {
+    printf("[WG_AG] rank=%d, num_ag_wgs=%d, total_ag_tiles=%d\n",
+           params.my_rank, num_ag_wgs, total_ag_tiles);
   }
 }
 
@@ -677,24 +699,17 @@ void gemm_allreduce_device(
   int num_m_tiles = ceil_div(m, int(get<0>(mma.tile_mnk())));
   int num_gemm_wgs = num_m_tiles * num_n_tiles;
 
-  // Linearize WG index: first num_gemm_wgs are GEMM, rest are reducers.
-  // Grid layout: dim0 = num_n_tiles groups, dim1 = (num_m_tiles + num_reducer_rows) groups
-  // GEMM WGs: group(1) < num_m_tiles
-  // Reducer WGs: group(1) >= num_m_tiles
+  // Grid layout: GEMM WGs first, then RS WGs, then AG WGs.
   int wg_m = int(item.get_group(1));
   int wg_n = int(item.get_group(0));
   int num_groups_dim0 = int(item.get_group_range(0));
   int linear_wg_id = wg_m * num_groups_dim0 + wg_n;
   int local_id = int(item.get_local_id(0));
 
-  // Debug: print kernel launch info (only once from WG 0, thread 0)
-  if (debug_log && linear_wg_id == 0 && local_id == 0) {
-    printf("[AR-KERNEL] rank=%d, M=%d, N=%d, K=%d, num_m_tiles=%d, num_n_tiles=%d, "
-           "num_gemm_wgs=%d, num_reducer_wgs=%d, signal_token=%u, wg_size=%d\n",
-           rank, m, n, int(shape<1>(A)), num_m_tiles, num_n_tiles,
-           num_gemm_wgs, num_reducer_wgs, signal_token,
-           int(item.get_local_range(0)));
-  }
+  // Split num_reducer_wgs into RS and AG WGs (environment configurable)
+  // Default: half RS, half AG. Override with CUTLASS_AR_NUM_RS_WGS.
+  int num_rs_wgs = num_reducer_wgs / 2;
+  int num_ag_wgs = num_reducer_wgs - num_rs_wgs;
 
   // Build params
   GemmAllreduceParams params{};
@@ -718,34 +733,44 @@ void gemm_allreduce_device(
   params.D = reinterpret_cast<SyclBF16*>(D.data().get());
   params.ldd = stride<0>(D);
   params.remote_out_ptrs_dev = reinterpret_cast<SyclBF16**>(ipc_out_ptrs);
-  params.use_push_mode = true;  // Push flags to remote
+  params.use_push_mode = true;
   params.signal_token = signal_token;
   params.max_active_reducer_wgs = num_reducer_wgs;
 
   if (linear_wg_id < num_gemm_wgs) {
-    // ---- GEMM workgroup: compute tile, write data, push flags ----
+    // ---- GEMM workgroup: tile interleave order ----
+    // Map linear WG id to interleaved tile coordinates (round-robin across chunks)
+    int chunk_m_tiles = num_m_tiles / world_size;
+    int linear_tile_id = linear_wg_id;
+    int tile_n = linear_tile_id % num_n_tiles;
+    int tile_row_linear = linear_tile_id / num_n_tiles;  // 0..num_m_tiles-1
+    // Interleave: distribute rows across chunks for early RS start
+    int chunk_id = tile_row_linear % world_size;
+    int row_within_chunk = tile_row_linear / world_size;
+    int tile_m = chunk_id * chunk_m_tiles + row_within_chunk;
+
     if (debug_log && local_id == 0) {
-      printf("[AR-GEMM] rank=%d, wg=(%d,%d), linear=%d, tile_m=%d, tile_n=%d\n",
-             rank, wg_m, wg_n, linear_wg_id, wg_m, wg_n);
+      printf("[AR-GEMM] rank=%d, wg=%d, tile=(%d,%d)\n", rank, linear_wg_id, tile_m, tile_n);
     }
-    gemm_and_push(A, B, C, mma, alpha, params);
-    if (debug_log && local_id == 0) {
-      printf("[AR-GEMM-DONE] rank=%d, wg=(%d,%d), pushed flags for tile(%d,%d)\n",
-             rank, wg_m, wg_n, wg_m, wg_n);
-    }
-  } else {
-    // ---- Reducer workgroup: subgroup-level tile reduction ----
-    int reducer_wg_id = linear_wg_id - num_gemm_wgs;
-    if (debug_log && local_id == 0) {
-      printf("[AR-REDUCER] rank=%d, reducer_wg_id=%d/%d, linear=%d\n",
-             rank, reducer_wg_id, num_reducer_wgs, linear_wg_id);
-    }
-    reducer_work_subgroup(item, reducer_wg_id, num_reducer_wgs, params, debug_log);
-    if (debug_log && local_id == 0) {
-      printf("[AR-REDUCER-DONE] rank=%d, reducer_wg_id=%d\n",
-             rank, reducer_wg_id);
+    gemm_and_push(A, B, C, mma, alpha, params, tile_m, tile_n);
+  } else if (linear_wg_id < num_gemm_wgs + num_rs_wgs + num_ag_wgs) {
+    int comm_wg_id = linear_wg_id - num_gemm_wgs;
+    if (comm_wg_id < num_rs_wgs) {
+      // ---- RS workgroup ----
+      if (debug_log && local_id == 0) {
+        printf("[AR-RS] rank=%d, rs_wg_id=%d/%d\n", rank, comm_wg_id, num_rs_wgs);
+      }
+      rs_work(item, comm_wg_id, num_rs_wgs, params, debug_log);
+    } else {
+      // ---- AG workgroup ----
+      int ag_wg_id = comm_wg_id - num_rs_wgs;
+      if (debug_log && local_id == 0) {
+        printf("[AR-AG] rank=%d, ag_wg_id=%d/%d\n", rank, ag_wg_id, num_ag_wgs);
+      }
+      ag_work(item, ag_wg_id, num_ag_wgs, params, debug_log);
     }
   }
+  // else: inactive WG, return immediately
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

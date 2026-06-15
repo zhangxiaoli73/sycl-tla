@@ -1,0 +1,151 @@
+ 
+:: initializing oneAPI environment ...
+   debug.sh: BASH_VERSION = 5.2.37(1)-release
+   args: Using "$@" for setvars.sh arguments: --force
+:: advisor -- latest
+:: ccl -- latest
+:: compiler -- latest
+:: dal -- latest
+:: debugger -- latest
+:: dev-utilities -- latest
+:: dnnl -- latest
+:: dpcpp-ct -- latest
+:: dpl -- latest
+:: ipp -- latest
+:: ippcp -- latest
+:: mkl -- latest
+:: mpi -- latest
+:: pti -- latest
+:: tbb -- latest
+:: umf -- latest
+:: oneAPI environment initialized ::
+ 
+=== Verification ===
+[2] [rank 2] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[2] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[3] [rank 3] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[3] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728[3]  signal_elems_bytes=20480
+[2] zl_debug finish malloc local buffer and flag 
+[2] zl_debug memset signal buffer
+[2] zl_debug memset data buffer
+[2] zl_debug memset done
+[2] zl_debug start to do IPC exchange 
+[3] zl_debug finish malloc local buffer and flag 
+[3] zl_debug memset signal buffer
+[3] zl_debug memset data buffer
+[1] [rank 1] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[1] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[3] zl_debug memset done
+[3] zl_debug start to do IPC exchange 
+[1] zl_debug finish malloc local buffer and flag 
+[1] zl_debug memset signal buffer
+[1] zl_debug memset data buffer
+[0] [rank 0] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[0] zl_debug start to malloc local buffer and flag, [0] data_elems_bytes=134217728 signal_elems_bytes=20480[0] 
+[1] zl_debug memset done
+[1] zl_debug start to do IPC exchange 
+[0] zl_debug finish malloc local buffer and flag 
+[0] zl_debug memset signal buffer
+[0] zl_debug memset data buffer
+[0] zl_debug memset done
+[0] zl_debug start to do IPC exchange 
+[3] zl_debug finish the IPC exchange 
+[0] zl_debug finish the IPC exchange 
+[2] zl_debug finish the IPC exchange 
+[1] zl_debug finish the IPC exchange 
+[3] zl_debug start to make resident
+[2] zl_debug start to make resident
+[0] zl_debug start to make resident
+[1] zl_debug start to make resident
+[3] zl_debug finish making resident
+[2] zl_debug finish making resident
+[0] zl_debug finish making resident
+[1] zl_debug finish making resident
+[0] [rank 0] Grid: 256 GEMM WGs + 32 reducer WGs (32 requested), subgroups_per_reducer_wg=32
+[0] [rank 0] initialization complete
+[1] [rank 1] initialization complete
+[2] [rank 2] initialization complete
+[3] [rank 3] initialization complete
+[0] [rank 0] Verification PASSED: max_abs=0.000000e+00, max_rel=0.000000e+00, mismatches=0/16777216 (expected=16384.000)
+[2] [rank 2] Verification PASSED: max_abs=0.000000e+00, max_rel=0.000000e+00, mismatches=0/16777216 (expected=16384.000)
+[3] [rank 3] Verification PASSED: max_abs=0.000000e+00, max_rel=0.000000e+00, mismatches=0/16777216 (expected=16384.000)
+[1] [rank 1] Verification PASSED: max_abs=0.000000e+00, max_rel=0.000000e+00, mismatches=0/16777216 (expected=16384.000)
+[0] [rank 0] warmup start (10 iters)
+[1] [rank 1] warmup start (10 iters)
+[2] [rank 2] warmup start (10 iters)
+[3] [rank 3] warmup start (10 iters)
+[0] [rank 0] warmup done
+[1] [rank 1] warmup done
+[2] [rank 2] warmup done
+[3] [rank 3] warmup done
+[0] [0] Problem Size: 4096x4096x4096, TP=4
+[0] [0] GEMM + Allreduce (host): [50.673]TFlop/s  (2.7123)ms
+[1] [1] Problem Size: 4096x4096x4096, TP=4
+[1] [1] GEMM + Allreduce (host): [50.679]TFlop/s  (2.7119)ms
+[2] [2] Problem Size: 4096x4096x4096, TP=4
+[2] [2] GEMM + Allreduce (host): [50.668]TFlop/s  (2.7125)ms
+[3] [3] Problem Size: 4096x4096x4096, TP=4
+[3] [3] GEMM + Allreduce (host): [50.692]TFlop/s  (2.7113)ms
+
+=== Benchmark ===
+[0] [rank 0] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[0] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[3] [rank 3] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[3] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[1] [rank 1] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[1] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[0] zl_debug finish malloc local buffer and flag 
+[0] zl_debug memset signal buffer
+[0] zl_debug memset data buffer
+[0] zl_debug memset done
+[0] zl_debug start to do IPC exchange 
+[3] zl_debug finish malloc local buffer and flag 
+[3] zl_debug memset signal buffer
+[3] zl_debug memset data buffer
+[1] zl_debug finish malloc local buffer and flag 
+[1] zl_debug memset signal buffer
+[1] zl_debug memset data buffer
+[3] zl_debug memset done
+[3] zl_debug start to do IPC exchange 
+[1] zl_debug memset done
+[1] zl_debug start to do IPC exchange 
+[2] [rank 2] Allocated: A=32.00 MiB, B=32.00 MiB, D=32.00 MiB
+[2] zl_debug start to malloc local buffer and flag, data_elems_bytes=134217728 signal_elems_bytes=20480
+[2] zl_debug finish malloc local buffer and flag 
+[2] zl_debug memset signal buffer
+[2] zl_debug memset data buffer
+[2] zl_debug memset done
+[2] zl_debug start to do IPC exchange 
+[2] zl_debug finish the IPC exchange 
+[0] zl_debug finish the IPC exchange 
+[3] zl_debug finish the IPC exchange 
+[1] zl_debug finish the IPC exchange 
+[3] zl_debug start to make resident
+[2] zl_debug start to make resident
+[0] zl_debug start to make resident
+[1] zl_debug start to make resident
+[3] zl_debug finish making resident
+[2] zl_debug finish making resident
+[0] zl_debug finish making resident
+[1] zl_debug finish making resident
+[0] [rank 0] Grid: 256 GEMM WGs + 32 reducer WGs (32 requested), subgroups_per_reducer_wg=32
+[0] [rank 0] initialization complete
+[0] [rank 0] warmup start (10 iters)
+[1] [rank 1] initialization complete
+[1] [rank 1] warmup start (10 iters)
+[2] [rank 2] initialization complete
+[2] [rank 2] warmup start (10 iters)
+[3] [rank 3] initialization complete
+[3] [rank 3] warmup start (10 iters)
+[0] [rank 0] warmup done
+[1] [rank 1] warmup done
+[2] [rank 2] warmup done
+[3] [rank 3] warmup done
+[0] [0] Problem Size: 4096x4096x4096, TP=4
+[0] [0] GEMM + Allreduce (host): [50.732]TFlop/s  (2.7091)ms
+[1] [1] Problem Size: 4096x4096x4096, TP=4
+[1] [1] GEMM + Allreduce (host): [50.738]TFlop/s  (2.7088)ms
+[2] [2] Problem Size: 4096x4096x4096, TP=4
+[2] [2] GEMM + Allreduce (host): [50.730]TFlop/s  (2.7092)ms
+[3] [3] Problem Size: 4096x4096x4096, TP=4
+[3] [3] GEMM + Allreduce (host): [50.743]TFlop/s  (2.7085)ms
